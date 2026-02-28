@@ -9,7 +9,8 @@ import tkinter as tk
 from tkinter import ttk
 from bleak import BleakClient, BleakScanner
 
-SAMPLERATE = 44100
+# --- 升級至 48kHz ---
+SAMPLERATE = 48000
 CHANNELS = 2
 
 last_accel = {}    
@@ -18,8 +19,6 @@ connected_addresses = set()
 reserved_ids = set() 
 active_ids = set() 
 
-# --- GUI 參數儲存區 ---
-# IMU 2 預設音量降至 0.3，尾音長度預設在中間值 0.5
 gui_params = {
     1: {'vol': 0.8, 'tail': 0.5},
     2: {'vol': 0.3, 'tail': 0.5}, 
@@ -29,6 +28,19 @@ gui_params = {
 
 SUB_GAIN_BASE = 0.2  
 
+# --- 陽光喜氣大九和弦 (C Major 9: C, E, G, B, D) ---
+MAJOR_9_SCALE = [
+    261.63, # C4
+    329.63, # E4
+    392.00, # G4
+    493.88, # B4
+    587.33, # D5
+    659.25, # E5
+    783.99, # G5
+    987.77, # B5
+    1174.66 # D6
+]
+
 class FMVoice:
     def __init__(self, voice_id):
         self.id = voice_id
@@ -36,22 +48,23 @@ class FMVoice:
         if voice_id == 1:
             self.base_ratio = 11.72
             self.mod_index = 0.8
-            self.base_freq = 600.0
         elif voice_id == 2:
             self.base_ratio = 3.41
             self.mod_index = 1.2
-            self.base_freq = 400.0
         elif voice_id == 3:
             self.base_ratio = 7.13
             self.mod_index = 0.6
-            self.base_freq = 550.0
         else: 
             self.base_ratio = 2.0
             self.mod_index = 0.4
-            self.base_freq = 350.0
 
-        self.freq = self.base_freq
-        self.sub_freq = 80.0  
+        # 使用目標頻率與當前頻率來做平滑過渡 (防爆音核心)
+        self.freq = MAJOR_9_SCALE[0]
+        self.target_freq = MAJOR_9_SCALE[0]
+        
+        self.sub_freq = 65.0  
+        self.target_sub_freq = 65.0
+        
         self.ratio = self.base_ratio
         
         self.phase_c = 0
@@ -67,28 +80,25 @@ class FMVoice:
         self.last_out = 0.0
         self.pan = random.choice([random.uniform(0.1, 0.3), random.uniform(0.7, 0.9)])
 
-        self.max_delay_samples = int(SAMPLERATE * 0.5)
+        self.max_delay_samples = int(SAMPLERATE * 0.6)
         self.delay_buffer = np.zeros((self.max_delay_samples, 2))
         self.delay_ptr = 0
-        self.current_delay_samples = int(SAMPLERATE * 0.3)
+        
+        # 消除 Delay Buffer 爆音：給予每顆固定的延遲時間，不再隨機跳動
+        delay_times = {1: 0.3, 2: 0.35, 3: 0.4, 4: 0.25}
+        self.current_delay_samples = int(SAMPLERATE * delay_times.get(voice_id, 0.3))
 
     def trigger(self, power):
         tail_val = gui_params[self.id]['tail']
-        
-        # --- 核心修正：聲學 RT60 完美平滑映射 ---
-        # 讓滑桿對應實際的秒數 (0.2秒 到 4.0秒)
         decay_time_sec = 0.2 + (tail_val * 3.8)
-        # 反推指數衰減率 (確保在指定秒數內衰減至 0.001)
         self.decay_rate = 0.001 ** (1.0 / (decay_time_sec * SAMPLERATE))
         
         self.target_amp = min(0.8, power / 4.0 + 0.15)
-        attack_sec = random.uniform(0.03, 0.07)
+        # 稍微拉長一點點 Attack，避免低頻開頭的 Click
+        attack_sec = random.uniform(0.04, 0.08)
         self.attack_step = self.target_amp / (SAMPLERATE * attack_sec)
         self.state = 'ATTACK'  
         
-        random_sec = random.uniform(0.15, 0.40)
-        self.current_delay_samples = int(SAMPLERATE * random_sec)
-        self.ratio = self.base_ratio + random.uniform(-0.05, 0.05)
         self.pan = random.choice([random.uniform(0.1, 0.3), random.uniform(0.7, 0.9)])
 
     def next_block(self, frames):
@@ -106,43 +116,51 @@ class FMVoice:
                     self.state = 'IDLE'
             env[i] = self.current_amp
 
-        t = (np.arange(frames) / SAMPLERATE)
-        mod_freq = self.freq * self.ratio
-        m_vals = np.sin(self.phase_m + 2 * np.pi * mod_freq * t) * self.mod_index
-        raw_fm = np.sin(self.phase_c + 2 * np.pi * self.freq * t + m_vals) * env
-        raw_sub = np.sin(self.phase_sub + 2 * np.pi * self.sub_freq * t) * env * SUB_GAIN_BASE
+        # --- 防爆音核心：平滑頻率滑音 (Portamento) ---
+        glide_speed = 0.01 # 數值越小滑得越慢，0.01 能消除 click 且保留琶音的顆粒感
         
-        alpha = self.cutoff / (self.cutoff + SAMPLERATE / (2 * np.pi))
-        filtered_fm = np.zeros(frames)
-        current_last = self.last_out
-        for i in range(frames):
-            current_last = current_last + alpha * (raw_fm[i] - current_last)
-            filtered_fm[i] = current_last
-        self.last_out = current_last
-        
-        self.phase_c = (self.phase_c + 2 * np.pi * self.freq * frames / SAMPLERATE) % (2 * np.pi)
-        self.phase_m = (self.phase_m + 2 * np.pi * mod_freq * frames / SAMPLERATE) % (2 * np.pi)
-        self.phase_sub = (self.phase_sub + 2 * np.pi * self.sub_freq * frames / SAMPLERATE) % (2 * np.pi)
-        
-        # Ping-Pong Echo 的殘響反饋量，也同步被滑桿平滑控制
-        tail_val = gui_params[self.id]['tail']
-        feedback_base = 0.1 + (tail_val * 0.6) 
-
         out_stereo = np.zeros((frames, 2))
+        
+        # Sample-accurate 的運算
         for i in range(frames):
-            fm_L = filtered_fm[i] * (1.0 - self.pan)
-            fm_R = filtered_fm[i] * self.pan
+            # 頻率平滑逼近目標
+            self.freq += (self.target_freq - self.freq) * glide_speed
+            self.sub_freq += (self.target_sub_freq - self.sub_freq) * glide_speed
             
+            # FM 運算
+            mod_freq = self.freq * self.ratio
+            m_val = np.sin(self.phase_m) * self.mod_index
+            raw_fm = np.sin(self.phase_c + m_val) * env[i]
+            
+            # Sub 運算
+            raw_sub = np.sin(self.phase_sub) * env[i] * SUB_GAIN_BASE
+            
+            # Lowpass Filter
+            alpha = self.cutoff / (self.cutoff + SAMPLERATE / (2 * np.pi))
+            self.last_out = self.last_out + alpha * (raw_fm - self.last_out)
+            
+            # 更新相位
+            self.phase_c = (self.phase_c + 2 * np.pi * self.freq / SAMPLERATE) % (2 * np.pi)
+            self.phase_m = (self.phase_m + 2 * np.pi * mod_freq / SAMPLERATE) % (2 * np.pi)
+            self.phase_sub = (self.phase_sub + 2 * np.pi * self.sub_freq / SAMPLERATE) % (2 * np.pi)
+            
+            # Panning
+            fm_L = self.last_out * (1.0 - self.pan)
+            fm_R = self.last_out * self.pan
+            
+            # Ping-Pong Echo
             read_ptr = (self.delay_ptr - self.current_delay_samples) % self.max_delay_samples
             delayed_signal = self.delay_buffer[read_ptr]
             
             mix_L = fm_L * 0.7 + delayed_signal[0] * 0.4
             mix_R = fm_R * 0.7 + delayed_signal[1] * 0.4
             
-            out_stereo[i, 0] = mix_L + raw_sub[i]
-            out_stereo[i, 1] = mix_R + raw_sub[i]
+            out_stereo[i, 0] = mix_L + raw_sub
+            out_stereo[i, 1] = mix_R + raw_sub
             
-            feedback = feedback_base + random.uniform(-0.02, 0.02)
+            tail_val = gui_params[self.id]['tail']
+            feedback = (0.1 + (tail_val * 0.6)) + random.uniform(-0.02, 0.02)
+            
             self.delay_buffer[self.delay_ptr, 0] = fm_L + delayed_signal[1] * feedback
             self.delay_buffer[self.delay_ptr, 1] = fm_R + delayed_signal[0] * feedback
             self.delay_ptr = (self.delay_ptr + 1) % self.max_delay_samples
@@ -156,7 +174,10 @@ def audio_callback(outdata, frames, time, status):
     mixed_all = np.zeros((frames, 2))
     for v in poly_voices.values():
         mixed_all += v.next_block(frames)
-    outdata[:] = mixed_all
+    
+    # --- 防爆音核心：Soft Clipper (柔和限幅器) ---
+    # 確保總音量不管疊加多少層，波形都不會超過 -1.0 到 1.0 導致 DAC 破音
+    outdata[:] = np.tanh(mixed_all)
 
 def handle_imu_data(imu_id, data):
     if len(data) < 20 or data[0] != 0x55 or data[1] != 0x61: return
@@ -167,8 +188,17 @@ def handle_imu_data(imu_id, data):
     pitch = vals[7] / 32768.0 * 180
 
     v = poly_voices[imu_id]
-    v.freq = v.base_freq + (pitch + 90) * 8 
-    v.sub_freq = 65.0 + (pitch + 90) * 0.15 
+    
+    # 映射到大九和弦
+    normalized_pitch = (pitch + 90) / 180.0
+    note_idx = int(normalized_pitch * len(MAJOR_9_SCALE))
+    note_idx = max(0, min(len(MAJOR_9_SCALE) - 1, note_idx))
+    
+    # 這裡只改變 target_freq，讓 audio thread 去平滑追蹤
+    v.target_freq = MAJOR_9_SCALE[note_idx]
+    
+    # 低頻也平滑追蹤
+    v.target_sub_freq = 65.0 + (pitch + 90) * 0.15 
     v.cutoff = 2000 + abs(roll) * 45
     
     now = time.time()
@@ -191,7 +221,7 @@ async def connect_imu(device, imu_id):
             poly_voices[imu_id].current_amp = 0.0
             poly_voices[imu_id].state = 'IDLE'
             
-            print(f"✅ IMU {imu_id} 就緒 ({device.name})")
+            print(f"✅ IMU {imu_id} 48kHz 無爆音引擎就緒")
             await client.start_notify(NOTIFY_CHAR, lambda s, d: handle_imu_data(imu_id, d))
             await client.write_gatt_char(WRITE_CHAR, bytes([0xFF, 0xAA, 0x69, 0x88, 0xB5]))
             while client.is_connected: 
@@ -202,7 +232,6 @@ async def connect_imu(device, imu_id):
         active_ids.discard(imu_id)
         reserved_ids.discard(imu_id)
         connected_addresses.discard(device.address)
-        print(f"ℹ️ IMU {imu_id} 等待重新連線")
 
 async def manager():
     with sd.OutputStream(channels=2, callback=audio_callback, samplerate=SAMPLERATE):
@@ -228,12 +257,10 @@ def run_audio_engine():
     asyncio.set_event_loop(loop)
     loop.run_until_complete(manager())
 
-# --- GUI 介面建置 (加入一鍵靜音與加長推桿) ---
 vol_sliders = {}
 tail_sliders = {}
 
 def mute_all():
-    """緊急一鍵靜音功能"""
     for i in range(1, 5):
         gui_params[i]['vol'] = 0.0
         vol_sliders[i].set(0.0)
@@ -244,7 +271,7 @@ def create_gui():
     root.geometry("500x420")
     root.configure(padx=20, pady=20)
     
-    title = tk.Label(root, text="Sonic Squid - 展演控制台", font=("Helvetica", 16, "bold"))
+    title = tk.Label(root, text="Sonic Squid - 展演控制台 (48kHz)", font=("Helvetica", 16, "bold"))
     title.grid(row=0, column=0, columnspan=4, pady=(0, 20))
 
     for i in range(1, 5):
@@ -252,14 +279,12 @@ def create_gui():
         frame.grid(row=1, column=i-1, padx=10, sticky="n")
         
         tk.Label(frame, text="音量").pack(pady=(5, 0))
-        # 使用 tk.Scale 取代 ttk.Scale，並設定 resolution=0.01 確保絕對平滑
         vol_sliders[i] = tk.Scale(frame, from_=1.0, to=0.0, orient="vertical", length=130, resolution=0.01, showvalue=False)
         vol_sliders[i].set(gui_params[i]['vol'])
         vol_sliders[i].pack(pady=5)
         vol_sliders[i].config(command=lambda val, idx=i: gui_params[idx].update({'vol': float(val)}))
         
         tk.Label(frame, text="尾音長度").pack(pady=(10, 0))
-        # 加長實體推桿，讓你更好抓中間值
         tail_sliders[i] = tk.Scale(frame, from_=1.0, to=0.0, orient="vertical", length=130, resolution=0.01, showvalue=False)
         tail_sliders[i].set(gui_params[i]['tail'])
         tail_sliders[i].pack(pady=5)
