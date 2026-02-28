@@ -18,6 +18,8 @@ connected_addresses = set()
 reserved_ids = set() 
 active_ids = set() 
 
+# --- GUI 參數儲存區 ---
+# IMU 2 預設音量降至 0.3，尾音長度預設在中間值 0.5
 gui_params = {
     1: {'vol': 0.8, 'tail': 0.5},
     2: {'vol': 0.3, 'tail': 0.5}, 
@@ -27,41 +29,29 @@ gui_params = {
 
 SUB_GAIN_BASE = 0.2  
 
-# --- 核心新增：C 大九和弦 (C Major 9) 頻率表 ---
-# 包含 C, E, G, B, D，橫跨三個八度，帶來豎琴般的琶音感
-MAJOR_9_ARPEGGIO = [
-    261.63, # C4 (中央 C)
-    329.63, # E4
-    392.00, # G4
-    493.88, # B4
-    587.33, # D5
-    659.25, # E5
-    783.99, # G5
-    987.77, # B5
-    1174.66 # D6
-]
-
 class FMVoice:
     def __init__(self, voice_id):
         self.id = voice_id
         
-        # --- 音色和諧化 ---
-        # 為了配合大九和弦的喜氣，將 FM Ratio 改為和諧的整數或簡單分數
         if voice_id == 1:
-            self.base_ratio = 2.0  # 亮麗的鐵琴
+            self.base_ratio = 11.72
             self.mod_index = 0.8
+            self.base_freq = 600.0
         elif voice_id == 2:
-            self.base_ratio = 1.0  # 溫潤的木琴
+            self.base_ratio = 3.41
             self.mod_index = 1.2
+            self.base_freq = 400.0
         elif voice_id == 3:
-            self.base_ratio = 4.0  # 喜氣的音樂盒鐘聲
+            self.base_ratio = 7.13
             self.mod_index = 0.6
+            self.base_freq = 550.0
         else: 
-            self.base_ratio = 0.5  # 厚實的電鋼琴
+            self.base_ratio = 2.0
             self.mod_index = 0.4
+            self.base_freq = 350.0
 
-        self.freq = MAJOR_9_ARPEGGIO[0]
-        self.sub_freq = 65.41 # 預設 C2 低頻
+        self.freq = self.base_freq
+        self.sub_freq = 80.0  
         self.ratio = self.base_ratio
         
         self.phase_c = 0
@@ -84,7 +74,11 @@ class FMVoice:
 
     def trigger(self, power):
         tail_val = gui_params[self.id]['tail']
+        
+        # --- 核心修正：聲學 RT60 完美平滑映射 ---
+        # 讓滑桿對應實際的秒數 (0.2秒 到 4.0秒)
         decay_time_sec = 0.2 + (tail_val * 3.8)
+        # 反推指數衰減率 (確保在指定秒數內衰減至 0.001)
         self.decay_rate = 0.001 ** (1.0 / (decay_time_sec * SAMPLERATE))
         
         self.target_amp = min(0.8, power / 4.0 + 0.15)
@@ -94,8 +88,7 @@ class FMVoice:
         
         random_sec = random.uniform(0.15, 0.40)
         self.current_delay_samples = int(SAMPLERATE * random_sec)
-        # 取消音色的隨機微調，確保和弦純正不走音
-        self.ratio = self.base_ratio 
+        self.ratio = self.base_ratio + random.uniform(-0.05, 0.05)
         self.pan = random.choice([random.uniform(0.1, 0.3), random.uniform(0.7, 0.9)])
 
     def next_block(self, frames):
@@ -117,7 +110,6 @@ class FMVoice:
         mod_freq = self.freq * self.ratio
         m_vals = np.sin(self.phase_m + 2 * np.pi * mod_freq * t) * self.mod_index
         raw_fm = np.sin(self.phase_c + 2 * np.pi * self.freq * t + m_vals) * env
-        
         raw_sub = np.sin(self.phase_sub + 2 * np.pi * self.sub_freq * t) * env * SUB_GAIN_BASE
         
         alpha = self.cutoff / (self.cutoff + SAMPLERATE / (2 * np.pi))
@@ -132,6 +124,7 @@ class FMVoice:
         self.phase_m = (self.phase_m + 2 * np.pi * mod_freq * frames / SAMPLERATE) % (2 * np.pi)
         self.phase_sub = (self.phase_sub + 2 * np.pi * self.sub_freq * frames / SAMPLERATE) % (2 * np.pi)
         
+        # Ping-Pong Echo 的殘響反饋量，也同步被滑桿平滑控制
         tail_val = gui_params[self.id]['tail']
         feedback_base = 0.1 + (tail_val * 0.6) 
 
@@ -174,21 +167,8 @@ def handle_imu_data(imu_id, data):
     pitch = vals[7] / 32768.0 * 180
 
     v = poly_voices[imu_id]
-    
-    # --- 核心修改：和弦鎖定 (Quantization) ---
-    # 將 -90 到 90 度的 pitch 角度，轉換為 0 到 8 的陣列索引
-    normalized_pitch = (pitch + 90) / 180.0
-    note_idx = int(normalized_pitch * len(MAJOR_9_ARPEGGIO))
-    note_idx = max(0, min(len(MAJOR_9_ARPEGGIO) - 1, note_idx)) # 確保不超出陣列範圍
-    
-    # 從大九和弦表中抓取正確的頻率
-    v.freq = MAJOR_9_ARPEGGIO[note_idx]
-    
-    # 讓推動水波的低頻，跟隨和弦的「根音(C)與屬音(G)」，保持在 65Hz ~ 98Hz 之間
-    # 這能確保水波的幾何圖形穩定且漂亮
-    sub_notes = [65.41, 82.41, 98.00] # C2, E2, G2
-    v.sub_freq = sub_notes[note_idx % 3] 
-    
+    v.freq = v.base_freq + (pitch + 90) * 8 
+    v.sub_freq = 65.0 + (pitch + 90) * 0.15 
     v.cutoff = 2000 + abs(roll) * 45
     
     now = time.time()
@@ -199,7 +179,6 @@ def handle_imu_data(imu_id, data):
     if (current_g > 1.8 or delta_g > 0.8) and (now - last_trigger.get(imu_id, 0) > 0.15):
         v.trigger(current_g) 
         last_trigger[imu_id] = now
-        print(f"🌸 IMU {imu_id} Arp Note! Freq: {v.freq:.1f} Hz")
 
 async def connect_imu(device, imu_id):
     WRITE_CHAR = "0000ffe9-0000-1000-8000-00805f9a34fb"
@@ -212,7 +191,7 @@ async def connect_imu(device, imu_id):
             poly_voices[imu_id].current_amp = 0.0
             poly_voices[imu_id].state = 'IDLE'
             
-            print(f"✅ IMU {imu_id} 喜氣琶音就緒")
+            print(f"✅ IMU {imu_id} 就緒 ({device.name})")
             await client.start_notify(NOTIFY_CHAR, lambda s, d: handle_imu_data(imu_id, d))
             await client.write_gatt_char(WRITE_CHAR, bytes([0xFF, 0xAA, 0x69, 0x88, 0xB5]))
             while client.is_connected: 
@@ -223,6 +202,7 @@ async def connect_imu(device, imu_id):
         active_ids.discard(imu_id)
         reserved_ids.discard(imu_id)
         connected_addresses.discard(device.address)
+        print(f"ℹ️ IMU {imu_id} 等待重新連線")
 
 async def manager():
     with sd.OutputStream(channels=2, callback=audio_callback, samplerate=SAMPLERATE):
@@ -248,10 +228,12 @@ def run_audio_engine():
     asyncio.set_event_loop(loop)
     loop.run_until_complete(manager())
 
+# --- GUI 介面建置 (加入一鍵靜音與加長推桿) ---
 vol_sliders = {}
 tail_sliders = {}
 
 def mute_all():
+    """緊急一鍵靜音功能"""
     for i in range(1, 5):
         gui_params[i]['vol'] = 0.0
         vol_sliders[i].set(0.0)
@@ -270,12 +252,14 @@ def create_gui():
         frame.grid(row=1, column=i-1, padx=10, sticky="n")
         
         tk.Label(frame, text="音量").pack(pady=(5, 0))
+        # 使用 tk.Scale 取代 ttk.Scale，並設定 resolution=0.01 確保絕對平滑
         vol_sliders[i] = tk.Scale(frame, from_=1.0, to=0.0, orient="vertical", length=130, resolution=0.01, showvalue=False)
         vol_sliders[i].set(gui_params[i]['vol'])
         vol_sliders[i].pack(pady=5)
         vol_sliders[i].config(command=lambda val, idx=i: gui_params[idx].update({'vol': float(val)}))
         
         tk.Label(frame, text="尾音長度").pack(pady=(10, 0))
+        # 加長實體推桿，讓你更好抓中間值
         tail_sliders[i] = tk.Scale(frame, from_=1.0, to=0.0, orient="vertical", length=130, resolution=0.01, showvalue=False)
         tail_sliders[i].set(gui_params[i]['tail'])
         tail_sliders[i].pack(pady=5)
