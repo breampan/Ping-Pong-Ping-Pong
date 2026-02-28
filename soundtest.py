@@ -18,8 +18,7 @@ connected_addresses = set()
 reserved_ids = set() 
 active_ids = set() 
 
-# --- GUI 參數新增：sens (靈敏度 1~10) ---
-# 預設 5.0，大約需要中等力度的揮擊
+# 靈敏度 1~10，數值越低需要越大力出拳
 gui_params = {
     1: {'vol': 0.8, 'tail': 0.5, 'sens': 5.0},
     2: {'vol': 0.4, 'tail': 0.5, 'sens': 5.0}, 
@@ -27,7 +26,8 @@ gui_params = {
     4: {'vol': 0.8, 'tail': 0.5, 'sens': 5.0},
 }
 
-SUB_GAIN_BASE = 0.5  # 稍微調高基礎水波推力，因為現在需要大力出拳才能達到最大值
+# 提高基礎推力，以彌補水波在 Echo 衰減過程中的能量損失
+SUB_GAIN_BASE = 0.65  
 
 class SciFiVoice:
     def __init__(self, voice_id):
@@ -57,7 +57,10 @@ class SciFiVoice:
         self.sub_attack_step = 0.0
         self.sub_decay_rate = 0.9998
         
-        self.pan = random.choice([random.uniform(0.1, 0.3), random.uniform(0.7, 0.9)])
+        # --- 核心修改 1：極端聲相 ---
+        # 0.0 = 100% 左聲道，1.0 = 100% 右聲道，讓水波起始點絕對分明
+        self.pan = random.choice([0.0, 1.0])
+        
         self.max_delay_samples = int(SAMPLERATE * 0.6)
         self.delay_buffer = np.zeros((self.max_delay_samples, 2))
         self.delay_ptr = 0
@@ -71,33 +74,28 @@ class SciFiVoice:
             self.phase_2 = 0
             self.phase_sub = 0
 
-        # --- 核心：計算「出拳力度 (Intensity)」 ---
-        # 計算超過門檻的能量，映射到 0.1(輕拳) ~ 1.0(重拳)
+        # 計算出拳力度
         overshoot = power - threshold
         intensity = np.clip(overshoot / 3.0 + 0.15, 0.1, 1.0)
 
-        # 1. 根據力度決定高頻音量與起振速度
         tail_val = gui_params[self.id]['tail']
         decay_time_sec = 0.2 + (tail_val * 3.8)
         self.decay_rate = 0.001 ** (1.0 / (decay_time_sec * SAMPLERATE))
         
-        self.target_amp = intensity * 0.6  # 力道越大，高頻越響
-        
-        # 出拳越猛，Attack 越短 (10ms)；越輕，Attack 越柔和 (50ms)
+        self.target_amp = intensity * 0.6  
         attack_sec = 0.05 - (intensity * 0.04)
         self.attack_step = self.target_amp / (SAMPLERATE * attack_sec)
         self.state = 'ATTACK'  
         
-        # 2. 根據力度決定低頻 (水波) 推力
-        self.sub_target = intensity * 1.0  # 力道直接轉換為推水深度
-        
-        # 水波起振也跟著力度變快
+        # 低頻水波推力
+        self.sub_target = intensity * 1.0  
         sub_attack_sec = 0.08 - (intensity * 0.05) 
         self.sub_attack_step = self.sub_target / (SAMPLERATE * sub_attack_sec)
         self.sub_decay_rate = 0.001 ** (1.0 / (0.3 * SAMPLERATE))
         self.sub_state = 'ATTACK'
         
-        self.pan = random.choice([random.uniform(0.1, 0.3), random.uniform(0.7, 0.9)])
+        # 每次觸發重新決定起始邊
+        self.pan = random.choice([0.0, 1.0])
 
     def next_block(self, frames):
         env = np.zeros(frames)
@@ -146,23 +144,29 @@ class SciFiVoice:
             self.phase_2 = (self.phase_2 + 2 * np.pi * freq2 / SAMPLERATE) % (2 * np.pi)
             self.phase_sub = (self.phase_sub + 2 * np.pi * self.sub_freq / SAMPLERATE) % (2 * np.pi)
             
+            # 分配直達聲的左右空間
             fm_L = (raw_osc1 * 0.7 + raw_osc2 * 0.3) * (1.0 - self.pan)
             fm_R = (raw_osc1 * 0.3 + raw_osc2 * 0.7) * self.pan
+            
+            # --- 核心修改 2：將低頻納入空間分配 ---
+            sub_L = raw_sub * (1.0 - self.pan)
+            sub_R = raw_sub * self.pan
             
             read_ptr = (self.delay_ptr - self.current_delay_samples) % self.max_delay_samples
             delayed_signal = self.delay_buffer[read_ptr]
             
-            mix_L = fm_L * 0.7 + delayed_signal[0] * 0.4
-            mix_R = fm_R * 0.7 + delayed_signal[1] * 0.4
-            
-            out_stereo[i, 0] = mix_L + raw_sub
-            out_stereo[i, 1] = mix_R + raw_sub
+            # 結合：高頻 + 低頻 + 完整的延遲訊號 (延遲訊號中已包含水波殘響)
+            out_stereo[i, 0] = (fm_L * 0.7 + sub_L) + delayed_signal[0]
+            out_stereo[i, 1] = (fm_R * 0.7 + sub_R) + delayed_signal[1]
             
             tail_val = gui_params[self.id]['tail']
-            feedback = (0.1 + (tail_val * 0.6)) + random.uniform(-0.02, 0.02)
+            feedback = 0.15 + (tail_val * 0.6) 
             
-            self.delay_buffer[self.delay_ptr, 0] = fm_L + delayed_signal[1] * feedback
-            self.delay_buffer[self.delay_ptr, 1] = fm_R + delayed_signal[0] * feedback
+            # --- 核心修改 3：物理 Ping-Pong 寫入 ---
+            # 左聲道吃右邊的延遲，右聲道吃左邊的延遲，高頻與低頻一起彈跳
+            self.delay_buffer[self.delay_ptr, 0] = (fm_L * 0.7 + sub_L) + delayed_signal[1] * feedback
+            self.delay_buffer[self.delay_ptr, 1] = (fm_R * 0.7 + sub_R) + delayed_signal[0] * feedback
+            
             self.delay_ptr = (self.delay_ptr + 1) % self.max_delay_samples
 
         current_vol = gui_params[self.id]['vol']
@@ -196,12 +200,10 @@ def handle_imu_data(imu_id, data):
     delta_g = abs(current_g - prev_g)
     last_accel[imu_id] = current_g
     
-    # --- 核心：將 GUI 靈敏度 (1~10) 轉換為 G力門檻 (4.5g ~ 1.5g) ---
+    # 靈敏度映射
     sens_val = gui_params[imu_id]['sens']
-    # Sens=10 -> Threshold=1.5 (輕碰就響) | Sens=1 -> Threshold=4.2 (重拳才響)
     threshold = 4.5 - (sens_val * 0.3)
     
-    # 判斷出拳：合成加速度超過設定門檻
     if current_g > threshold and (now - last_trigger.get(imu_id, 0) > 0.2):
         v.trigger(current_g, threshold) 
         last_trigger[imu_id] = now
@@ -218,7 +220,7 @@ async def connect_imu(device, imu_id):
             poly_voices[imu_id].current_amp = 0.0
             poly_voices[imu_id].state = 'IDLE'
             
-            print(f"✅ IMU {imu_id} 力度感測引擎就緒")
+            print(f"✅ IMU {imu_id} 水波激盪引擎就緒")
             await client.start_notify(NOTIFY_CHAR, lambda s, d: handle_imu_data(imu_id, d))
             await client.write_gatt_char(WRITE_CHAR, bytes([0xFF, 0xAA, 0x69, 0x88, 0xB5]))
             while client.is_connected: 
@@ -266,10 +268,10 @@ def mute_all():
 def create_gui():
     root = tk.Tk()
     root.title("Ping Pong Ping Pong - Mixer")
-    root.geometry("600x500") # 稍微拉大視窗容納新的推桿
+    root.geometry("600x500") 
     root.configure(padx=20, pady=20)
     
-    title = tk.Label(root, text="Sonic Squid - 出拳力度感測版", font=("Helvetica", 16, "bold"))
+    title = tk.Label(root, text="Sonic Squid - 視覺水波激盪版", font=("Helvetica", 16, "bold"))
     title.grid(row=0, column=0, columnspan=4, pady=(0, 20))
 
     for i in range(1, 5):
@@ -282,20 +284,18 @@ def create_gui():
         vol_sliders[i].pack(pady=5)
         vol_sliders[i].config(command=lambda val, idx=i: gui_params[idx].update({'vol': float(val)}))
         
-        tk.Label(frame, text="尾音長度").pack(pady=(10, 0))
+        tk.Label(frame, text="水波/尾音長度").pack(pady=(10, 0))
         tail_sliders[i] = tk.Scale(frame, from_=1.0, to=0.0, orient="vertical", length=100, resolution=0.01, showvalue=False)
         tail_sliders[i].set(gui_params[i]['tail'])
         tail_sliders[i].pack(pady=5)
         tail_sliders[i].config(command=lambda val, idx=i: gui_params[idx].update({'tail': float(val)}))
         
-        # --- 新增：靈敏度推桿 ---
         tk.Label(frame, text="靈敏度").pack(pady=(10, 0))
         sens_sliders[i] = tk.Scale(frame, from_=10.0, to=1.0, orient="vertical", length=100, resolution=0.1, showvalue=False)
         sens_sliders[i].set(gui_params[i]['sens'])
         sens_sliders[i].pack(pady=5)
         sens_sliders[i].config(command=lambda val, idx=i: gui_params[idx].update({'sens': float(val)}))
-        # 加入說明小字
-        tk.Label(frame, text="(上:輕碰 / 下:重拳)", font=("Helvetica", 10), fg="gray").pack(pady=(0, 5))
+        tk.Label(frame, text="(上:碰 / 下:拳)", font=("Helvetica", 10), fg="gray").pack(pady=(0, 5))
 
     mute_btn = ttk.Button(root, text="一鍵靜音 (Mute All)", command=mute_all)
     mute_btn.grid(row=2, column=0, columnspan=4, pady=25)
