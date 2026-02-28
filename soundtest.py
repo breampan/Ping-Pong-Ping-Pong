@@ -20,56 +20,47 @@ active_ids = set()
 
 gui_params = {
     1: {'vol': 0.8, 'tail': 0.5},
-    2: {'vol': 0.3, 'tail': 0.5}, 
+    2: {'vol': 0.4, 'tail': 0.5}, 
     3: {'vol': 0.8, 'tail': 0.5},
     4: {'vol': 0.8, 'tail': 0.5},
 }
 
-# 極低的基礎增益，讓 40Hz 變成隱形的物理推手
-SUB_GAIN_BASE = 0.12  
+# 經過優化後的低頻推力
+SUB_GAIN_BASE = 0.4  
 
-class FMVoice:
+class SciFiVoice:
     def __init__(self, voice_id):
         self.id = voice_id
         
-        # 回歸科技感的 FM 比例設定
-        if voice_id == 1:
-            self.base_ratio = 11.72
-            self.mod_index = 0.8
-            self.base_freq = 600.0
-        elif voice_id == 2:
-            self.base_ratio = 3.41
-            self.mod_index = 1.2
-            self.base_freq = 400.0
-        elif voice_id == 3:
-            self.base_ratio = 7.13
-            self.mod_index = 0.6
-            self.base_freq = 550.0
-        else: 
-            self.base_ratio = 2.0
-            self.mod_index = 0.4
-            self.base_freq = 350.0
-
+        # 給予每顆傳感器不同的基礎音高，確保空間層次感
+        base_freqs = {1: 600.0, 2: 400.0, 3: 800.0, 4: 500.0}
+        self.base_freq = base_freqs[voice_id]
+        
         self.freq = self.base_freq
         self.target_freq = self.base_freq
         
-        # 初始低頻設定在 40Hz
         self.sub_freq = 40.0  
         self.target_sub_freq = 40.0
         
-        self.ratio = self.base_ratio
-        
-        self.phase_c = 0
-        self.phase_m = 0
+        # 雙振盪器相位 + 低頻相位
+        self.phase_1 = 0
+        self.phase_2 = 0
         self.phase_sub = 0
         
+        # --- 獨立高頻包絡線 ---
         self.state = 'IDLE'
         self.current_amp = 0.0
         self.target_amp = 0.0
         self.attack_step = 0.0
         self.decay_rate = 0.9998
-        self.cutoff = 2000.0      
-        self.last_out = 0.0
+        
+        # --- 獨立低頻包絡線 (水波專用) ---
+        self.sub_state = 'IDLE'
+        self.current_sub_amp = 0.0
+        self.sub_target = 0.0
+        self.sub_attack_step = 0.0
+        self.sub_decay_rate = 0.9998
+        
         self.pan = random.choice([random.uniform(0.1, 0.3), random.uniform(0.7, 0.9)])
 
         self.max_delay_samples = int(SAMPLERATE * 0.6)
@@ -77,25 +68,41 @@ class FMVoice:
         self.delay_ptr = 0
         
         delay_times = {1: 0.3, 2: 0.35, 3: 0.4, 4: 0.25}
-        self.current_delay_samples = int(SAMPLERATE * delay_times.get(voice_id, 0.3))
+        self.current_delay_samples = int(SAMPLERATE * delay_times[voice_id])
 
     def trigger(self, power):
+        # 消除爆音核心：如果在完全靜音狀態下觸發，強制將相位歸零 (Zero-Crossing)
+        if self.current_amp < 0.005 and self.current_sub_amp < 0.005:
+            self.phase_1 = 0
+            self.phase_2 = 0
+            self.phase_sub = 0
+
+        # --- 1. 高頻音量設定 (受 GUI 控制) ---
         tail_val = gui_params[self.id]['tail']
         decay_time_sec = 0.2 + (tail_val * 3.8)
         self.decay_rate = 0.001 ** (1.0 / (decay_time_sec * SAMPLERATE))
         
-        self.target_amp = min(0.8, power / 4.0 + 0.15)
-        
-        # 為了搭配 40Hz 且避免爆音，Attack 設為 20ms~40ms (約一個 40Hz 的週期)
-        attack_sec = random.uniform(0.02, 0.04)
+        self.target_amp = min(0.6, power / 4.0 + 0.1)
+        attack_sec = random.uniform(0.04, 0.08)
         self.attack_step = self.target_amp / (SAMPLERATE * attack_sec)
         self.state = 'ATTACK'  
+        
+        # --- 2. 低頻音量設定 (不受 GUI 影響的完美撥弦 Pizzicato) ---
+        # 固定的 60ms 溫和推力，300ms 極速收斂，確保水波乾淨漂亮
+        self.sub_target = min(1.0, power / 3.0 + 0.2)
+        self.sub_attack_step = self.sub_target / (SAMPLERATE * 0.06)
+        self.sub_decay_rate = 0.001 ** (1.0 / (0.3 * SAMPLERATE))
+        self.sub_state = 'ATTACK'
         
         self.pan = random.choice([random.uniform(0.1, 0.3), random.uniform(0.7, 0.9)])
 
     def next_block(self, frames):
         env = np.zeros(frames)
+        sub_env = np.zeros(frames)
+        
+        # 雙重包絡線即時運算
         for i in range(frames):
+            # 高頻
             if self.state == 'ATTACK':
                 self.current_amp += self.attack_step
                 if self.current_amp >= self.target_amp:
@@ -106,44 +113,56 @@ class FMVoice:
                 if self.current_amp < 0.0001:
                     self.current_amp = 0.0
                     self.state = 'IDLE'
-            env[i] = self.current_amp
+            
+            # 低頻
+            if self.sub_state == 'ATTACK':
+                self.current_sub_amp += self.sub_attack_step
+                if self.current_sub_amp >= self.sub_target:
+                    self.current_sub_amp = self.sub_target
+                    self.sub_state = 'DECAY'
+            elif self.sub_state == 'DECAY':
+                self.current_sub_amp *= self.sub_decay_rate
+                if self.current_sub_amp < 0.0001:
+                    self.current_sub_amp = 0.0
+                    self.sub_state = 'IDLE'
 
-        # 恢復科技感的平滑滑音 (Portamento)
+            env[i] = self.current_amp
+            sub_env[i] = self.current_sub_amp
+
         glide_speed = 0.015 
-        
         out_stereo = np.zeros((frames, 2))
         
         for i in range(frames):
+            # 滑音平滑器
             self.freq += (self.target_freq - self.freq) * glide_speed
             self.sub_freq += (self.target_sub_freq - self.sub_freq) * glide_speed
             
-            # 高頻 FM 運算
-            mod_freq = self.freq * self.ratio
-            m_val = np.sin(self.phase_m) * self.mod_index
-            raw_fm = np.sin(self.phase_c + m_val) * env[i]
+            # --- 科技感核心：Detuned Dual Oscillators (失諧雙振盪器) ---
+            # 創造極致純淨、寬廣的科幻音色，沒有任何詭異的金屬聲
+            freq2 = self.freq * 1.008 # 輕微的音高偏移，產生 Lush 的合唱感
             
-            # --- 核心修改：Sub-Pizzicato ---
-            # 將 env[i] 平方，創造出極短促、緊實的弱撥弦推力，不影響高頻
-            pizzicato_env = env[i] ** 2
-            raw_sub = np.sin(self.phase_sub) * pizzicato_env * SUB_GAIN_BASE
+            raw_osc1 = np.sin(self.phase_1) * env[i]
+            raw_osc2 = np.sin(self.phase_2) * env[i]
             
-            alpha = self.cutoff / (self.cutoff + SAMPLERATE / (2 * np.pi))
-            self.last_out = self.last_out + alpha * (raw_fm - self.last_out)
+            # 專注於推動物理水波的獨立低頻
+            raw_sub = np.sin(self.phase_sub) * sub_env[i] * SUB_GAIN_BASE
             
-            self.phase_c = (self.phase_c + 2 * np.pi * self.freq / SAMPLERATE) % (2 * np.pi)
-            self.phase_m = (self.phase_m + 2 * np.pi * mod_freq / SAMPLERATE) % (2 * np.pi)
+            self.phase_1 = (self.phase_1 + 2 * np.pi * self.freq / SAMPLERATE) % (2 * np.pi)
+            self.phase_2 = (self.phase_2 + 2 * np.pi * freq2 / SAMPLERATE) % (2 * np.pi)
             self.phase_sub = (self.phase_sub + 2 * np.pi * self.sub_freq / SAMPLERATE) % (2 * np.pi)
             
-            fm_L = self.last_out * (1.0 - self.pan)
-            fm_R = self.last_out * self.pan
+            # 立體聲寬廣化 (將兩顆振盪器稍微拉開)
+            fm_L = (raw_osc1 * 0.7 + raw_osc2 * 0.3) * (1.0 - self.pan)
+            fm_R = (raw_osc1 * 0.3 + raw_osc2 * 0.7) * self.pan
             
+            # Echo 運算
             read_ptr = (self.delay_ptr - self.current_delay_samples) % self.max_delay_samples
             delayed_signal = self.delay_buffer[read_ptr]
             
             mix_L = fm_L * 0.7 + delayed_signal[0] * 0.4
             mix_R = fm_R * 0.7 + delayed_signal[1] * 0.4
             
-            # 結合：高頻 + 隱形極低頻水波驅動
+            # 將隱形低頻與高頻混合輸出
             out_stereo[i, 0] = mix_L + raw_sub
             out_stereo[i, 1] = mix_R + raw_sub
             
@@ -157,13 +176,15 @@ class FMVoice:
         current_vol = gui_params[self.id]['vol']
         return out_stereo * current_vol
 
-poly_voices = {1: FMVoice(1), 2: FMVoice(2), 3: FMVoice(3), 4: FMVoice(4)}
+# 使用新的 SciFiVoice
+poly_voices = {1: SciFiVoice(1), 2: SciFiVoice(2), 3: SciFiVoice(3), 4: SciFiVoice(4)}
 
 def audio_callback(outdata, frames, time, status):
     mixed_all = np.zeros((frames, 2))
     for v in poly_voices.values():
         mixed_all += v.next_block(frames)
     
+    # 柔和限幅器，確保不管多少聲音疊加都不會數位破音
     outdata[:] = np.tanh(mixed_all)
 
 def handle_imu_data(imu_id, data):
@@ -176,15 +197,12 @@ def handle_imu_data(imu_id, data):
 
     v = poly_voices[imu_id]
     
-    # --- 回歸科技滑音 ---
-    # 高頻：無段連續變化，帶有空靈的科技感
+    # 高頻科技連續滑音
     v.target_freq = v.base_freq + (pitch + 90) * 8.0 
     
-    # 低頻：將角度映射到 35Hz ~ 45Hz 的窄頻帶 (中央為 40Hz)
+    # 專注於 35Hz ~ 45Hz 的隱形推動力
     normalized_pitch = max(0.0, min(1.0, (pitch + 90) / 180.0))
     v.target_sub_freq = 35.0 + (normalized_pitch * 10.0)
-    
-    v.cutoff = 2000 + abs(roll) * 45
     
     now = time.time()
     prev_g = last_accel.get(imu_id, 1.0)
@@ -194,7 +212,7 @@ def handle_imu_data(imu_id, data):
     if (current_g > 1.8 or delta_g > 0.8) and (now - last_trigger.get(imu_id, 0) > 0.15):
         v.trigger(current_g) 
         last_trigger[imu_id] = now
-        print(f"🛸 IMU {imu_id} Sci-Fi Pluck! High:{v.target_freq:.0f}Hz | Sub:{v.target_sub_freq:.1f}Hz")
+        print(f"🛸 IMU {imu_id} Pure Sci-Fi! High:{v.target_freq:.0f}Hz | Sub:{v.target_sub_freq:.1f}Hz")
 
 async def connect_imu(device, imu_id):
     WRITE_CHAR = "0000ffe9-0000-1000-8000-00805f9a34fb"
@@ -207,7 +225,7 @@ async def connect_imu(device, imu_id):
             poly_voices[imu_id].current_amp = 0.0
             poly_voices[imu_id].state = 'IDLE'
             
-            print(f"✅ IMU {imu_id} 科技滑音引擎就緒")
+            print(f"✅ IMU {imu_id} 純淨科幻引擎就緒")
             await client.start_notify(NOTIFY_CHAR, lambda s, d: handle_imu_data(imu_id, d))
             await client.write_gatt_char(WRITE_CHAR, bytes([0xFF, 0xAA, 0x69, 0x88, 0xB5]))
             while client.is_connected: 
@@ -257,7 +275,7 @@ def create_gui():
     root.geometry("500x420")
     root.configure(padx=20, pady=20)
     
-    title = tk.Label(root, text="Sonic Squid - 展演控制台", font=("Helvetica", 16, "bold"))
+    title = tk.Label(root, text="Sonic Squid - 純淨科幻版", font=("Helvetica", 16, "bold"))
     title.grid(row=0, column=0, columnspan=4, pady=(0, 20))
 
     for i in range(1, 5):
