@@ -9,12 +9,13 @@ from bleak import BleakClient, BleakScanner
 # --- 音訊全域設定 ---
 SAMPLERATE = 44100
 CHANNELS = 2
-poly_voices = {}
-last_accel = {}
-last_trigger = {}
+poly_voices = {} 
+last_accel = {}    
+last_trigger = {}  
+connected_addresses = set() # 用來記錄已連線的 MAC，避免重複指派
 
 # --- 隨機 Echo 緩衝區設定 ---
-MAX_DELAY_SEC = 0.5
+MAX_DELAY_SEC = 0.5 
 MAX_DELAY_SAMPLES = int(SAMPLERATE * MAX_DELAY_SEC)
 delay_buffer = np.zeros((MAX_DELAY_SAMPLES, CHANNELS))
 delay_ptr = 0
@@ -23,22 +24,21 @@ current_delay_samples = int(SAMPLERATE * 0.3)
 class FMVoice:
     def __init__(self, voice_id):
         self.id = voice_id
-        # 高頻 FM 設定
         self.freq = 880.0
         self.mod_index = 0.8
-        self.ratio = 11.72
+        self.ratio = 11.72  
         self.phase_c = 0
         self.phase_m = 0
         
-        # 平行的 40Hz 低頻設定
-        self.sub_freq = 40.0
+        # 調整為 80Hz 驅動水波，波紋會更密集細緻
+        self.sub_freq = 80.0 
         self.phase_sub = 0
         
         self.amp = 0.0
         self.decay_rate = 0.9998
-        self.cutoff = 2000.0
+        self.cutoff = 2000.0      
         self.last_out = 0.0
-        self.pan = random.uniform(0.2, 0.8)
+        self.pan = random.uniform(0.2, 0.8) 
 
     def trigger(self, power):
         global current_delay_samples
@@ -52,15 +52,15 @@ class FMVoice:
     def next_block(self, frames):
         t = (np.arange(frames) / SAMPLERATE)
         
-        # 1. 產生晶瑩剔透的 FM 高頻
+        # 1. 產生高頻
         mod_freq = self.freq * self.ratio
         m_vals = np.sin(self.phase_m + 2 * np.pi * mod_freq * t) * self.mod_index
         raw_fm = np.sin(self.phase_c + 2 * np.pi * self.freq * t + m_vals) * self.amp
         
-        # 2. 產生平行的 40Hz 極低頻 (推動水波用)
+        # 2. 產生平行的 80Hz
         raw_sub = np.sin(self.phase_sub + 2 * np.pi * self.sub_freq * t) * self.amp
         
-        # FM 高頻進行 Resonance 濾波
+        # 濾波與相位更新
         alpha = self.cutoff / (self.cutoff + SAMPLERATE / (2 * np.pi))
         filtered_fm = np.zeros(frames)
         current_last = self.last_out
@@ -69,7 +69,6 @@ class FMVoice:
             filtered_fm[i] = current_last
         self.last_out = current_last
         
-        # 更新所有相位
         self.phase_c = (self.phase_c + 2 * np.pi * self.freq * frames / SAMPLERATE) % (2 * np.pi)
         self.phase_m = (self.phase_m + 2 * np.pi * mod_freq * frames / SAMPLERATE) % (2 * np.pi)
         self.phase_sub = (self.phase_sub + 2 * np.pi * self.sub_freq * frames / SAMPLERATE) % (2 * np.pi)
@@ -77,7 +76,6 @@ class FMVoice:
         self.amp *= (self.decay_rate ** frames)
         if self.amp < 0.0005: self.amp = 0
         
-        # 輸出處理：FM 具有隨機空間聲相，40Hz 則平均分配至雙聲道以確保喇叭推力平衡
         fm_stereo = np.zeros((frames, 2))
         fm_stereo[:, 0] = filtered_fm * (1.0 - self.pan)
         fm_stereo[:, 1] = filtered_fm * self.pan
@@ -86,7 +84,6 @@ class FMVoice:
         sub_stereo[:, 0] = raw_sub
         sub_stereo[:, 1] = raw_sub
         
-        # 分開回傳，讓低頻不進入 Echo 系統
         return fm_stereo, sub_stereo
 
 def audio_callback(outdata, frames, time, status):
@@ -100,30 +97,28 @@ def audio_callback(outdata, frames, time, status):
         mixed_sub += sub_out
     
     for i in range(frames):
-        # 讀取 Echo
         read_ptr = (delay_ptr - current_delay_samples) % MAX_DELAY_SAMPLES
         delayed_signal = delay_buffer[read_ptr]
         
-        # 最終混合：FM主音(0.6) + Echo延遲音(0.35) + 40Hz水波驅動音(1.0)
-        # 注意：40Hz 獲得較高的增益以推動實體，且完全不被 Echo 污染
+        # 混合輸出，80Hz 維持最高推力且不進 Echo
         outdata[i] = mixed_fm[i] * 0.6 + delayed_signal * 0.35 + mixed_sub[i] * 1.0
         
-        # 只有 FM 進入 Feedback 系統
         dynamic_feedback = 0.42 + random.uniform(-0.03, 0.03)
         delay_buffer[delay_ptr] = (mixed_fm[i] + delayed_signal * dynamic_feedback)
         delay_ptr = (delay_ptr + 1) % MAX_DELAY_SAMPLES
 
 def handle_imu_data(imu_id, data):
+    # 確保只解析 55 61 封包
     if len(data) < 20 or data[0] != 0x55 or data[1] != 0x61: return
     vals = struct.unpack('<hhhhhhhhh', data[2:20])
     ax, ay, az = [v / 32768.0 * 16 for v in vals[0:3]]
     current_g = (ax**2 + ay**2 + az**2)**0.5
-    roll = vals[6] / 32768.0 * 180
+    roll = vals[6] / 32768.0 * 180 
     pitch = vals[7] / 32768.0 * 180
 
     if imu_id in poly_voices:
         v = poly_voices[imu_id]
-        v.freq = 600 + (pitch + 90) * 12
+        v.freq = 600 + (pitch + 90) * 12 
         v.cutoff = 2000 + abs(roll) * 45
         
         now = time.time()
@@ -132,7 +127,7 @@ def handle_imu_data(imu_id, data):
         last_accel[imu_id] = current_g
         
         if (current_g > 1.8 or delta_g > 0.8) and (now - last_trigger.get(imu_id, 0) > 0.15):
-            v.trigger(current_g)
+            v.trigger(current_g) 
             last_trigger[imu_id] = now
             print(f"💧 IMU {imu_id} Wave Trigger! G:{current_g:.2f}")
 
@@ -142,26 +137,42 @@ async def connect_imu(device, imu_id):
     try:
         async with BleakClient(device) as client:
             poly_voices[imu_id] = FMVoice(imu_id)
-            print(f"✅ IMU {imu_id} OK")
+            print(f"✅ IMU {imu_id} 就緒 ({device.name})")
+            
             await client.start_notify(NOTIFY_CHAR, lambda s, d: handle_imu_data(imu_id, d))
             await client.write_gatt_char(WRITE_CHAR, bytes([0xFF, 0xAA, 0x69, 0x88, 0xB5]))
-            while client.is_connected: await asyncio.sleep(1)
-    except Exception: pass
-    finally: poly_voices.pop(imu_id, None)
+            
+            while client.is_connected: 
+                await asyncio.sleep(1)
+    except Exception as e: 
+        print(f"❌ IMU {imu_id} 連線中斷: {e}")
+    finally: 
+        poly_voices.pop(imu_id, None)
+        connected_addresses.discard(device.address)
+        print(f"ℹ️ IMU {imu_id} 已釋放，等待重新連線")
 
 async def manager():
     with sd.OutputStream(channels=2, callback=audio_callback, samplerate=SAMPLERATE):
-        print("=== Sonic Squid: Hydro-Acoustic Edition 啟動 ===")
-        connected_addresses = set()
+        print("=== 80Hz 高速水波驅動引擎 啟動 ===")
+        print("正在高速掃描... 請打開所有傳感器電源")
         while True:
+            # 如果還沒連滿 4 顆，進入高速掃描模式
             if len(poly_voices) < 4:
                 devices = await BleakScanner.discover(timeout=1.0)
                 for d in devices:
                     if d.name and d.name.startswith("WT") and d.address not in connected_addresses:
-                        imu_id = len(poly_voices) + 1
+                        # 核心邏輯：自動尋找 1~4 之間尚未被使用的最小編號
+                        used_ids = set(poly_voices.keys())
+                        if len(used_ids) >= 4: break
+                        new_id = next(i for i in range(1, 5) if i not in used_ids)
+                        
                         connected_addresses.add(d.address)
-                        asyncio.create_task(connect_imu(d, imu_id))
-            await asyncio.sleep(3)
+                        asyncio.create_task(connect_imu(d, new_id))
+                # 高速循環，只等待 0.2 秒就繼續找
+                await asyncio.sleep(0.2)
+            else:
+                # 4 顆都連滿了，才進入省電待命模式
+                await asyncio.sleep(2.0)
 
 if __name__ == "__main__":
     try: asyncio.run(manager())
