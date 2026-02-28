@@ -21,18 +21,34 @@ delay_buffer = np.zeros((MAX_DELAY_SAMPLES, CHANNELS))
 delay_ptr = 0
 current_delay_samples = int(SAMPLERATE * 0.3)
 
-# --- 核心修正：大幅降低低頻推力 ---
-SUB_GAIN = 0.2  # 從 0.8 降回 0.2，避免水被炸開
+SUB_GAIN = 0.2  
 
 class FMVoice:
     def __init__(self, voice_id):
         self.id = voice_id
         
-        self.freq = 600.0
+        # --- 核心修改 1：根據 IMU 1~4 給予不同音色 ---
+        if voice_id == 1:
+            self.base_ratio = 11.72 # 晶瑩玻璃
+            self.mod_index = 0.8
+            self.base_freq = 600.0
+        elif voice_id == 2:
+            self.base_ratio = 3.41  # 木質馬林巴
+            self.mod_index = 1.2
+            self.base_freq = 400.0
+        elif voice_id == 3:
+            self.base_ratio = 7.13  # 金屬鐘聲
+            self.mod_index = 0.6
+            self.base_freq = 550.0
+        else: # voice_id == 4
+            self.base_ratio = 2.0   # 溫潤空靈
+            self.mod_index = 0.4
+            self.base_freq = 350.0
+
+        self.freq = self.base_freq
         self.sub_freq = 80.0  
+        self.ratio = self.base_ratio
         
-        self.mod_index = 0.8
-        self.ratio = 11.72  
         self.phase_c = 0
         self.phase_m = 0
         self.phase_sub = 0
@@ -45,25 +61,28 @@ class FMVoice:
         
         self.cutoff = 2000.0      
         self.last_out = 0.0
-        self.pan = random.uniform(0.2, 0.8) 
+        
+        # 為了讓 Ping-Pong 更明顯，觸發時隨機偏向極左或極右
+        self.pan = random.choice([random.uniform(0.1, 0.3), random.uniform(0.7, 0.9)])
 
     def trigger(self, power):
         global current_delay_samples
         
-        # 壓縮力度：即使甩很大力，音量最高只到 0.8，留給喇叭緩衝空間
         self.target_amp = min(0.8, power / 4.0 + 0.15)
         
-        # --- 核心修正：軟槌打擊感 (30ms ~ 70ms) ---
-        # 夠快能產生撥弦感，但夠慢不至於產生物理爆炸
+        # 軟打擊的 ADSR attack time
         attack_sec = random.uniform(0.03, 0.07)
         self.attack_step = self.target_amp / (SAMPLERATE * attack_sec)
         
         self.decay_rate = random.uniform(0.99975, 0.99988)
         self.state = 'ATTACK'  
         
-        random_sec = random.uniform(0.15, 0.45)
+        random_sec = random.uniform(0.15, 0.40)
         current_delay_samples = int(SAMPLERATE * random_sec)
-        self.ratio = 11.72 + random.uniform(-0.1, 0.1)
+        # 音色微調
+        self.ratio = self.base_ratio + random.uniform(-0.05, 0.05)
+        # 每次觸發重新決定起始位置，增加跳躍感
+        self.pan = random.choice([random.uniform(0.1, 0.3), random.uniform(0.7, 0.9)])
 
     def next_block(self, frames):
         env = np.zeros(frames)
@@ -82,12 +101,11 @@ class FMVoice:
 
         t = (np.arange(frames) / SAMPLERATE)
         
-        # 高頻
         mod_freq = self.freq * self.ratio
         m_vals = np.sin(self.phase_m + 2 * np.pi * mod_freq * t) * self.mod_index
         raw_fm = np.sin(self.phase_c + 2 * np.pi * self.freq * t + m_vals) * env
         
-        # 低頻：平行聯動 + 較安全的增益
+        # 平行低頻，不受音色差異影響
         raw_sub = np.sin(self.phase_sub + 2 * np.pi * self.sub_freq * t) * env * SUB_GAIN
         
         alpha = self.cutoff / (self.cutoff + SAMPLERATE / (2 * np.pi))
@@ -126,11 +144,15 @@ def audio_callback(outdata, frames, time, status):
         read_ptr = (delay_ptr - current_delay_samples) % MAX_DELAY_SAMPLES
         delayed_signal = delay_buffer[read_ptr]
         
-        # 最終混合：低頻維持直達聲，確保推力平滑
-        outdata[i] = mixed_fm[i] * 0.6 + delayed_signal * 0.35 + mixed_sub[i]
+        outdata[i, 0] = mixed_fm[i, 0] * 0.6 + delayed_signal[0] * 0.4 + mixed_sub[i, 0]
+        outdata[i, 1] = mixed_fm[i, 1] * 0.6 + delayed_signal[1] * 0.4 + mixed_sub[i, 1]
         
-        dynamic_feedback = 0.42 + random.uniform(-0.03, 0.03)
-        delay_buffer[delay_ptr] = (mixed_fm[i] + delayed_signal * dynamic_feedback)
+        # --- 核心修改 2：Ping-Pong 交叉反饋 ---
+        dynamic_feedback = 0.45 + random.uniform(-0.02, 0.02)
+        # 左聲道緩衝區吃右聲道的延遲，右聲道緩衝區吃左聲道的延遲
+        delay_buffer[delay_ptr, 0] = mixed_fm[i, 0] + delayed_signal[1] * dynamic_feedback
+        delay_buffer[delay_ptr, 1] = mixed_fm[i, 1] + delayed_signal[0] * dynamic_feedback
+        
         delay_ptr = (delay_ptr + 1) % MAX_DELAY_SAMPLES
 
 def handle_imu_data(imu_id, data):
@@ -144,10 +166,8 @@ def handle_imu_data(imu_id, data):
     if imu_id in poly_voices:
         v = poly_voices[imu_id]
         
-        v.freq = 600 + (pitch + 90) * 12 
-        # 維持在 65Hz ~ 95Hz 的黃金水波駐波帶
+        v.freq = v.base_freq + (pitch + 90) * 8 
         v.sub_freq = 65.0 + (pitch + 90) * 0.15 
-        
         v.cutoff = 2000 + abs(roll) * 45
         
         now = time.time()
@@ -158,7 +178,7 @@ def handle_imu_data(imu_id, data):
         if (current_g > 1.8 or delta_g > 0.8) and (now - last_trigger.get(imu_id, 0) > 0.15):
             v.trigger(current_g) 
             last_trigger[imu_id] = now
-            print(f"🎸 IMU {imu_id} Soft Pluck! High:{v.freq:.0f}Hz / Sub:{v.sub_freq:.1f}Hz")
+            print(f"🎵 IMU {imu_id} Pluck! High:{v.freq:.0f}Hz / Sub:{v.sub_freq:.1f}Hz")
 
 async def connect_imu(device, imu_id):
     WRITE_CHAR = "0000ffe9-0000-1000-8000-00805f9a34fb"
@@ -167,7 +187,7 @@ async def connect_imu(device, imu_id):
         async with BleakClient(device) as client:
             poly_voices[imu_id] = FMVoice(imu_id)
             reserved_ids.discard(imu_id)
-            print(f"✅ IMU {imu_id} 就緒 ({device.name})")
+            print(f"✅ IMU {imu_id} 專屬音色就緒 ({device.name})")
             
             await client.start_notify(NOTIFY_CHAR, lambda s, d: handle_imu_data(imu_id, d))
             await client.write_gatt_char(WRITE_CHAR, bytes([0xFF, 0xAA, 0x69, 0x88, 0xB5]))
@@ -184,7 +204,7 @@ async def connect_imu(device, imu_id):
 
 async def manager():
     with sd.OutputStream(channels=2, callback=audio_callback, samplerate=SAMPLERATE):
-        print("=== Soft-Pluck 水波引擎 啟動 ===")
+        print("=== 四重奏 Ping-Pong 水波引擎 啟動 ===")
         while True:
             if len(poly_voices) + len(reserved_ids) < 4:
                 devices = await BleakScanner.discover(timeout=1.0)
