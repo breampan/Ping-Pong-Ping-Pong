@@ -9,23 +9,22 @@ import tkinter as tk
 from tkinter import ttk
 from bleak import BleakClient, BleakScanner
 
-# --- 音訊全域設定 ---
 SAMPLERATE = 44100
 CHANNELS = 2
 
-# --- 狀態與連線管理 ---
 last_accel = {}    
 last_trigger = {}  
 connected_addresses = set()
 reserved_ids = set() 
-active_ids = set() # 新增：用來安全追蹤正在連線的 ID
+active_ids = set() 
 
 # --- GUI 參數儲存區 ---
+# IMU 2 預設音量降至 0.3，尾音長度預設在中間值 0.5
 gui_params = {
-    1: {'vol': 0.8, 'tail': 0.3},
-    2: {'vol': 0.4, 'tail': 0.3}, 
-    3: {'vol': 0.8, 'tail': 0.3},
-    4: {'vol': 0.8, 'tail': 0.3},
+    1: {'vol': 0.8, 'tail': 0.5},
+    2: {'vol': 0.3, 'tail': 0.5}, 
+    3: {'vol': 0.8, 'tail': 0.5},
+    4: {'vol': 0.8, 'tail': 0.5},
 }
 
 SUB_GAIN_BASE = 0.2  
@@ -75,7 +74,12 @@ class FMVoice:
 
     def trigger(self, power):
         tail_val = gui_params[self.id]['tail']
-        self.decay_rate = 0.9995 + (tail_val * 0.0004)
+        
+        # --- 核心修正：聲學 RT60 完美平滑映射 ---
+        # 讓滑桿對應實際的秒數 (0.2秒 到 4.0秒)
+        decay_time_sec = 0.2 + (tail_val * 3.8)
+        # 反推指數衰減率 (確保在指定秒數內衰減至 0.001)
+        self.decay_rate = 0.001 ** (1.0 / (decay_time_sec * SAMPLERATE))
         
         self.target_amp = min(0.8, power / 4.0 + 0.15)
         attack_sec = random.uniform(0.03, 0.07)
@@ -120,8 +124,9 @@ class FMVoice:
         self.phase_m = (self.phase_m + 2 * np.pi * mod_freq * frames / SAMPLERATE) % (2 * np.pi)
         self.phase_sub = (self.phase_sub + 2 * np.pi * self.sub_freq * frames / SAMPLERATE) % (2 * np.pi)
         
+        # Ping-Pong Echo 的殘響反饋量，也同步被滑桿平滑控制
         tail_val = gui_params[self.id]['tail']
-        feedback_base = 0.1 + (tail_val * 0.5) 
+        feedback_base = 0.1 + (tail_val * 0.6) 
 
         out_stereo = np.zeros((frames, 2))
         for i in range(frames):
@@ -145,8 +150,6 @@ class FMVoice:
         current_vol = gui_params[self.id]['vol']
         return out_stereo * current_vol
 
-# --- 核心修正：預先分配 (Pre-allocation) ---
-# 一開始就把 4 個通道固定建好，迴圈迭代時就不會改變大小了！
 poly_voices = {1: FMVoice(1), 2: FMVoice(2), 3: FMVoice(3), 4: FMVoice(4)}
 
 def audio_callback(outdata, frames, time, status):
@@ -185,15 +188,12 @@ async def connect_imu(device, imu_id):
             active_ids.add(imu_id)
             reserved_ids.discard(imu_id)
             
-            # 連線時清空之前的殘響與音量狀態
             poly_voices[imu_id].current_amp = 0.0
             poly_voices[imu_id].state = 'IDLE'
             
             print(f"✅ IMU {imu_id} 就緒 ({device.name})")
-            
             await client.start_notify(NOTIFY_CHAR, lambda s, d: handle_imu_data(imu_id, d))
             await client.write_gatt_char(WRITE_CHAR, bytes([0xFF, 0xAA, 0x69, 0x88, 0xB5]))
-            
             while client.is_connected: 
                 await asyncio.sleep(1)
     except Exception as e: 
@@ -228,11 +228,20 @@ def run_audio_engine():
     asyncio.set_event_loop(loop)
     loop.run_until_complete(manager())
 
-# --- GUI 介面建置 ---
+# --- GUI 介面建置 (加入一鍵靜音與加長推桿) ---
+vol_sliders = {}
+tail_sliders = {}
+
+def mute_all():
+    """緊急一鍵靜音功能"""
+    for i in range(1, 5):
+        gui_params[i]['vol'] = 0.0
+        vol_sliders[i].set(0.0)
+
 def create_gui():
     root = tk.Tk()
     root.title("Ping Pong Ping Pong - Mixer")
-    root.geometry("500x350")
+    root.geometry("500x420")
     root.configure(padx=20, pady=20)
     
     title = tk.Label(root, text="Sonic Squid - 展演控制台", font=("Helvetica", 16, "bold"))
@@ -243,16 +252,21 @@ def create_gui():
         frame.grid(row=1, column=i-1, padx=10, sticky="n")
         
         tk.Label(frame, text="音量").pack(pady=(5, 0))
-        vol_slider = ttk.Scale(frame, from_=1.0, to=0.0, orient="vertical", length=120)
-        vol_slider.set(gui_params[i]['vol'])
-        vol_slider.pack(pady=5)
-        vol_slider.config(command=lambda val, idx=i: gui_params[idx].update({'vol': float(val)}))
+        # 使用 tk.Scale 取代 ttk.Scale，並設定 resolution=0.01 確保絕對平滑
+        vol_sliders[i] = tk.Scale(frame, from_=1.0, to=0.0, orient="vertical", length=130, resolution=0.01, showvalue=False)
+        vol_sliders[i].set(gui_params[i]['vol'])
+        vol_sliders[i].pack(pady=5)
+        vol_sliders[i].config(command=lambda val, idx=i: gui_params[idx].update({'vol': float(val)}))
         
         tk.Label(frame, text="尾音長度").pack(pady=(10, 0))
-        tail_slider = ttk.Scale(frame, from_=1.0, to=0.0, orient="vertical", length=80)
-        tail_slider.set(gui_params[i]['tail'])
-        tail_slider.pack(pady=5)
-        tail_slider.config(command=lambda val, idx=i: gui_params[idx].update({'tail': float(val)}))
+        # 加長實體推桿，讓你更好抓中間值
+        tail_sliders[i] = tk.Scale(frame, from_=1.0, to=0.0, orient="vertical", length=130, resolution=0.01, showvalue=False)
+        tail_sliders[i].set(gui_params[i]['tail'])
+        tail_sliders[i].pack(pady=5)
+        tail_sliders[i].config(command=lambda val, idx=i: gui_params[idx].update({'tail': float(val)}))
+
+    mute_btn = ttk.Button(root, text="一鍵靜音 (Mute All)", command=mute_all)
+    mute_btn.grid(row=2, column=0, columnspan=4, pady=25)
 
     root.mainloop()
 
