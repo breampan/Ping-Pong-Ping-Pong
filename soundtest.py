@@ -2,10 +2,14 @@ import asyncio
 import struct
 import time
 import random
+import threading
 import numpy as np
 import sounddevice as sd
+import tkinter as tk
+from tkinter import ttk
 from bleak import BleakClient, BleakScanner
 
+# --- 音訊全域設定 ---
 SAMPLERATE = 44100
 CHANNELS = 2
 poly_voices = {} 
@@ -15,19 +19,22 @@ last_trigger = {}
 connected_addresses = set()
 reserved_ids = set() 
 
-MAX_DELAY_SEC = 0.5 
-MAX_DELAY_SAMPLES = int(SAMPLERATE * MAX_DELAY_SEC)
-delay_buffer = np.zeros((MAX_DELAY_SAMPLES, CHANNELS))
-delay_ptr = 0
-current_delay_samples = int(SAMPLERATE * 0.3)
+# --- GUI 參數儲存區 ---
+# 預設 IMU 2 音量較小，且尾音長度 (tail) 預設縮短以減少混濁感
+gui_params = {
+    1: {'vol': 0.8, 'tail': 0.3},
+    2: {'vol': 0.4, 'tail': 0.3}, 
+    3: {'vol': 0.8, 'tail': 0.3},
+    4: {'vol': 0.8, 'tail': 0.3},
+}
 
-SUB_GAIN = 0.2  
+SUB_GAIN_BASE = 0.2  
 
 class FMVoice:
     def __init__(self, voice_id):
         self.id = voice_id
         
-        # --- 核心修改 1：根據 IMU 1~4 給予不同音色 ---
+        # 音色分配
         if voice_id == 1:
             self.base_ratio = 11.72 # 晶瑩玻璃
             self.mod_index = 0.8
@@ -40,7 +47,7 @@ class FMVoice:
             self.base_ratio = 7.13  # 金屬鐘聲
             self.mod_index = 0.6
             self.base_freq = 550.0
-        else: # voice_id == 4
+        else: 
             self.base_ratio = 2.0   # 溫潤空靈
             self.mod_index = 0.4
             self.base_freq = 350.0
@@ -58,33 +65,37 @@ class FMVoice:
         self.target_amp = 0.0
         self.attack_step = 0.0
         self.decay_rate = 0.9998
-        
         self.cutoff = 2000.0      
         self.last_out = 0.0
-        
-        # 為了讓 Ping-Pong 更明顯，觸發時隨機偏向極左或極右
         self.pan = random.choice([random.uniform(0.1, 0.3), random.uniform(0.7, 0.9)])
 
+        # --- 為每顆傳感器建立獨立的 Ping-Pong Echo 緩衝區 ---
+        self.max_delay_samples = int(SAMPLERATE * 0.5)
+        self.delay_buffer = np.zeros((self.max_delay_samples, 2))
+        self.delay_ptr = 0
+        self.current_delay_samples = int(SAMPLERATE * 0.3)
+
     def trigger(self, power):
-        global current_delay_samples
+        # 讀取 GUI 的尾音長度參數 (0.0 ~ 1.0)
+        tail_val = gui_params[self.id]['tail']
+        
+        # 根據 GUI 參數決定 ADSR 衰減長短 (越小消失越快)
+        # 短：0.9995 (約0.5秒) ~ 長：0.9999 (約3秒)
+        self.decay_rate = 0.9995 + (tail_val * 0.0004)
         
         self.target_amp = min(0.8, power / 4.0 + 0.15)
-        
-        # 軟打擊的 ADSR attack time
         attack_sec = random.uniform(0.03, 0.07)
         self.attack_step = self.target_amp / (SAMPLERATE * attack_sec)
-        
-        self.decay_rate = random.uniform(0.99975, 0.99988)
         self.state = 'ATTACK'  
         
+        # 隨機延遲間隔 (Ping-pong 速度)
         random_sec = random.uniform(0.15, 0.40)
-        current_delay_samples = int(SAMPLERATE * random_sec)
-        # 音色微調
+        self.current_delay_samples = int(SAMPLERATE * random_sec)
         self.ratio = self.base_ratio + random.uniform(-0.05, 0.05)
-        # 每次觸發重新決定起始位置，增加跳躍感
         self.pan = random.choice([random.uniform(0.1, 0.3), random.uniform(0.7, 0.9)])
 
     def next_block(self, frames):
+        # 1. 產生波形
         env = np.zeros(frames)
         for i in range(frames):
             if self.state == 'ATTACK':
@@ -100,13 +111,10 @@ class FMVoice:
             env[i] = self.current_amp
 
         t = (np.arange(frames) / SAMPLERATE)
-        
         mod_freq = self.freq * self.ratio
         m_vals = np.sin(self.phase_m + 2 * np.pi * mod_freq * t) * self.mod_index
         raw_fm = np.sin(self.phase_c + 2 * np.pi * self.freq * t + m_vals) * env
-        
-        # 平行低頻，不受音色差異影響
-        raw_sub = np.sin(self.phase_sub + 2 * np.pi * self.sub_freq * t) * env * SUB_GAIN
+        raw_sub = np.sin(self.phase_sub + 2 * np.pi * self.sub_freq * t) * env * SUB_GAIN_BASE
         
         alpha = self.cutoff / (self.cutoff + SAMPLERATE / (2 * np.pi))
         filtered_fm = np.zeros(frames)
@@ -120,40 +128,42 @@ class FMVoice:
         self.phase_m = (self.phase_m + 2 * np.pi * mod_freq * frames / SAMPLERATE) % (2 * np.pi)
         self.phase_sub = (self.phase_sub + 2 * np.pi * self.sub_freq * frames / SAMPLERATE) % (2 * np.pi)
         
-        fm_stereo = np.zeros((frames, 2))
-        fm_stereo[:, 0] = filtered_fm * (1.0 - self.pan)
-        fm_stereo[:, 1] = filtered_fm * self.pan
-        
-        sub_stereo = np.zeros((frames, 2))
-        sub_stereo[:, 0] = raw_sub
-        sub_stereo[:, 1] = raw_sub
-        
-        return fm_stereo, sub_stereo
+        # 2. 空間與獨立延遲運算 (Ping-Pong)
+        tail_val = gui_params[self.id]['tail']
+        # Echo 的反饋量也由 GUI 控制：0.1(只回聲一次) ~ 0.6(回聲多次)
+        feedback_base = 0.1 + (tail_val * 0.5) 
+
+        out_stereo = np.zeros((frames, 2))
+        for i in range(frames):
+            fm_L = filtered_fm[i] * (1.0 - self.pan)
+            fm_R = filtered_fm[i] * self.pan
+            
+            read_ptr = (self.delay_ptr - self.current_delay_samples) % self.max_delay_samples
+            delayed_signal = self.delay_buffer[read_ptr]
+            
+            # 乾濕混音
+            mix_L = fm_L * 0.7 + delayed_signal[0] * 0.4
+            mix_R = fm_R * 0.7 + delayed_signal[1] * 0.4
+            
+            # 將 FM 與 Sub-bass 結合
+            out_stereo[i, 0] = mix_L + raw_sub[i]
+            out_stereo[i, 1] = mix_R + raw_sub[i]
+            
+            # Ping-Pong 交叉回授
+            feedback = feedback_base + random.uniform(-0.02, 0.02)
+            self.delay_buffer[self.delay_ptr, 0] = fm_L + delayed_signal[1] * feedback
+            self.delay_buffer[self.delay_ptr, 1] = fm_R + delayed_signal[0] * feedback
+            self.delay_ptr = (self.delay_ptr + 1) % self.max_delay_samples
+
+        # 3. 套用 GUI 的總音量
+        current_vol = gui_params[self.id]['vol']
+        return out_stereo * current_vol
 
 def audio_callback(outdata, frames, time, status):
-    global delay_ptr
-    mixed_fm = np.zeros((frames, 2))
-    mixed_sub = np.zeros((frames, 2))
-    
+    mixed_all = np.zeros((frames, 2))
     for v in poly_voices.values():
-        fm_out, sub_out = v.next_block(frames)
-        mixed_fm += fm_out
-        mixed_sub += sub_out
-    
-    for i in range(frames):
-        read_ptr = (delay_ptr - current_delay_samples) % MAX_DELAY_SAMPLES
-        delayed_signal = delay_buffer[read_ptr]
-        
-        outdata[i, 0] = mixed_fm[i, 0] * 0.6 + delayed_signal[0] * 0.4 + mixed_sub[i, 0]
-        outdata[i, 1] = mixed_fm[i, 1] * 0.6 + delayed_signal[1] * 0.4 + mixed_sub[i, 1]
-        
-        # --- 核心修改 2：Ping-Pong 交叉反饋 ---
-        dynamic_feedback = 0.45 + random.uniform(-0.02, 0.02)
-        # 左聲道緩衝區吃右聲道的延遲，右聲道緩衝區吃左聲道的延遲
-        delay_buffer[delay_ptr, 0] = mixed_fm[i, 0] + delayed_signal[1] * dynamic_feedback
-        delay_buffer[delay_ptr, 1] = mixed_fm[i, 1] + delayed_signal[0] * dynamic_feedback
-        
-        delay_ptr = (delay_ptr + 1) % MAX_DELAY_SAMPLES
+        mixed_all += v.next_block(frames)
+    outdata[:] = mixed_all
 
 def handle_imu_data(imu_id, data):
     if len(data) < 20 or data[0] != 0x55 or data[1] != 0x61: return
@@ -165,7 +175,6 @@ def handle_imu_data(imu_id, data):
 
     if imu_id in poly_voices:
         v = poly_voices[imu_id]
-        
         v.freq = v.base_freq + (pitch + 90) * 8 
         v.sub_freq = 65.0 + (pitch + 90) * 0.15 
         v.cutoff = 2000 + abs(roll) * 45
@@ -178,7 +187,6 @@ def handle_imu_data(imu_id, data):
         if (current_g > 1.8 or delta_g > 0.8) and (now - last_trigger.get(imu_id, 0) > 0.15):
             v.trigger(current_g) 
             last_trigger[imu_id] = now
-            print(f"🎵 IMU {imu_id} Pluck! High:{v.freq:.0f}Hz / Sub:{v.sub_freq:.1f}Hz")
 
 async def connect_imu(device, imu_id):
     WRITE_CHAR = "0000ffe9-0000-1000-8000-00805f9a34fb"
@@ -187,7 +195,7 @@ async def connect_imu(device, imu_id):
         async with BleakClient(device) as client:
             poly_voices[imu_id] = FMVoice(imu_id)
             reserved_ids.discard(imu_id)
-            print(f"✅ IMU {imu_id} 專屬音色就緒 ({device.name})")
+            print(f"✅ IMU {imu_id} 就緒")
             
             await client.start_notify(NOTIFY_CHAR, lambda s, d: handle_imu_data(imu_id, d))
             await client.write_gatt_char(WRITE_CHAR, bytes([0xFF, 0xAA, 0x69, 0x88, 0xB5]))
@@ -200,11 +208,10 @@ async def connect_imu(device, imu_id):
         poly_voices.pop(imu_id, None)
         reserved_ids.discard(imu_id)
         connected_addresses.discard(device.address)
-        print(f"ℹ️ IMU {imu_id} 等待重新連線")
 
 async def manager():
     with sd.OutputStream(channels=2, callback=audio_callback, samplerate=SAMPLERATE):
-        print("=== 四重奏 Ping-Pong 水波引擎 啟動 ===")
+        print("=== 系統運作中，請於彈出視窗調整參數 ===")
         while True:
             if len(poly_voices) + len(reserved_ids) < 4:
                 devices = await BleakScanner.discover(timeout=1.0)
@@ -220,6 +227,51 @@ async def manager():
             else:
                 await asyncio.sleep(2.0)
 
+def run_audio_engine():
+    """在背景執行音訊與藍牙連線"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(manager())
+
+# --- GUI 介面建置 ---
+def create_gui():
+    root = tk.Tk()
+    root.title("Ping Pong Ping Pong - Mixer")
+    root.geometry("500x350")
+    root.configure(padx=20, pady=20)
+    
+    title = tk.Label(root, text="Sonic Squid - 展演控制台", font=("Helvetica", 16, "bold"))
+    title.grid(row=0, column=0, columnspan=4, pady=(0, 20))
+
+    # 建立四個 IMU 的推桿
+    for i in range(1, 5):
+        frame = ttk.LabelFrame(root, text=f"IMU {i}")
+        frame.grid(row=1, column=i-1, padx=10, sticky="n")
+        
+        # 音量推桿 (Volume)
+        tk.Label(frame, text="音量").pack(pady=(5, 0))
+        vol_slider = ttk.Scale(frame, from_=1.0, to=0.0, orient="vertical", length=120)
+        vol_slider.set(gui_params[i]['vol'])
+        vol_slider.pack(pady=5)
+        # 綁定即時更新
+        vol_slider.config(command=lambda val, idx=i: gui_params[idx].update({'vol': float(val)}))
+        
+        # 尾音長度推桿 (Tail / Echo Length)
+        tk.Label(frame, text="尾音長度").pack(pady=(10, 0))
+        tail_slider = ttk.Scale(frame, from_=1.0, to=0.0, orient="vertical", length=80)
+        tail_slider.set(gui_params[i]['tail'])
+        tail_slider.pack(pady=5)
+        tail_slider.config(command=lambda val, idx=i: gui_params[idx].update({'tail': float(val)}))
+
+    root.mainloop()
+
 if __name__ == "__main__":
-    try: asyncio.run(manager())
-    except KeyboardInterrupt: print("\n已停止。")
+    # 啟動音訊與藍牙背景執行緒
+    audio_thread = threading.Thread(target=run_audio_engine, daemon=True)
+    audio_thread.start()
+    
+    # 啟動主執行緒的 GUI 介面
+    try:
+        create_gui()
+    except KeyboardInterrupt:
+        print("\n已停止。")
