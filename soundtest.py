@@ -9,86 +9,108 @@ from bleak import BleakClient, BleakScanner
 # --- 音訊全域設定 ---
 SAMPLERATE = 44100
 CHANNELS = 2
-poly_voices = {} 
-last_accel = {}    
-last_trigger = {}  
+poly_voices = {}
+last_accel = {}
+last_trigger = {}
 
 # --- 隨機 Echo 緩衝區設定 ---
-MAX_DELAY_SEC = 0.5 
+MAX_DELAY_SEC = 0.5
 MAX_DELAY_SAMPLES = int(SAMPLERATE * MAX_DELAY_SEC)
 delay_buffer = np.zeros((MAX_DELAY_SAMPLES, CHANNELS))
 delay_ptr = 0
-current_delay_samples = int(SAMPLERATE * 0.3) # 初始間隔
+current_delay_samples = int(SAMPLERATE * 0.3)
 
 class FMVoice:
     def __init__(self, voice_id):
         self.id = voice_id
+        # 高頻 FM 設定
         self.freq = 880.0
         self.mod_index = 0.8
-        self.ratio = 11.72  
+        self.ratio = 11.72
         self.phase_c = 0
         self.phase_m = 0
+        
+        # 平行的 40Hz 低頻設定
+        self.sub_freq = 40.0
+        self.phase_sub = 0
+        
         self.amp = 0.0
         self.decay_rate = 0.9998
-        self.cutoff = 2000.0      
+        self.cutoff = 2000.0
         self.last_out = 0.0
-        self.pan = random.uniform(0.2, 0.8) 
+        self.pan = random.uniform(0.2, 0.8)
 
     def trigger(self, power):
         global current_delay_samples
         self.amp = min(1.0, power / 3.0 + 0.2)
-        
-        # 1. 限制聲音長度在 2.5 秒內隨機 (調大衰減係數)
-        # 0.99975 (~1.2s) 到 0.99988 (~2.5s)
         self.decay_rate = random.uniform(0.99975, 0.99988)
         
-        # 2. 每次觸發都改變下一次 Echo 的時間間隔 (可愛的隨機感)
         random_sec = random.uniform(0.15, 0.45)
         current_delay_samples = int(SAMPLERATE * random_sec)
-        
         self.ratio = 11.72 + random.uniform(-0.1, 0.1)
 
     def next_block(self, frames):
         t = (np.arange(frames) / SAMPLERATE)
+        
+        # 1. 產生晶瑩剔透的 FM 高頻
         mod_freq = self.freq * self.ratio
         m_vals = np.sin(self.phase_m + 2 * np.pi * mod_freq * t) * self.mod_index
-        raw_out = np.sin(self.phase_c + 2 * np.pi * self.freq * t + m_vals) * self.amp
+        raw_fm = np.sin(self.phase_c + 2 * np.pi * self.freq * t + m_vals) * self.amp
         
+        # 2. 產生平行的 40Hz 極低頻 (推動水波用)
+        raw_sub = np.sin(self.phase_sub + 2 * np.pi * self.sub_freq * t) * self.amp
+        
+        # FM 高頻進行 Resonance 濾波
         alpha = self.cutoff / (self.cutoff + SAMPLERATE / (2 * np.pi))
-        filtered_out = np.zeros(frames)
+        filtered_fm = np.zeros(frames)
         current_last = self.last_out
         for i in range(frames):
-            current_last = current_last + alpha * (raw_out[i] - current_last)
-            filtered_out[i] = current_last
+            current_last = current_last + alpha * (raw_fm[i] - current_last)
+            filtered_fm[i] = current_last
         self.last_out = current_last
         
+        # 更新所有相位
         self.phase_c = (self.phase_c + 2 * np.pi * self.freq * frames / SAMPLERATE) % (2 * np.pi)
         self.phase_m = (self.phase_m + 2 * np.pi * mod_freq * frames / SAMPLERATE) % (2 * np.pi)
+        self.phase_sub = (self.phase_sub + 2 * np.pi * self.sub_freq * frames / SAMPLERATE) % (2 * np.pi)
         
         self.amp *= (self.decay_rate ** frames)
         if self.amp < 0.0005: self.amp = 0
         
-        stereo_out = np.zeros((frames, 2))
-        stereo_out[:, 0] = filtered_out * (1.0 - self.pan)
-        stereo_out[:, 1] = filtered_out * self.pan
-        return stereo_out
+        # 輸出處理：FM 具有隨機空間聲相，40Hz 則平均分配至雙聲道以確保喇叭推力平衡
+        fm_stereo = np.zeros((frames, 2))
+        fm_stereo[:, 0] = filtered_fm * (1.0 - self.pan)
+        fm_stereo[:, 1] = filtered_fm * self.pan
+        
+        sub_stereo = np.zeros((frames, 2))
+        sub_stereo[:, 0] = raw_sub
+        sub_stereo[:, 1] = raw_sub
+        
+        # 分開回傳，讓低頻不進入 Echo 系統
+        return fm_stereo, sub_stereo
 
 def audio_callback(outdata, frames, time, status):
     global delay_ptr
-    mixed_out = np.zeros((frames, 2))
+    mixed_fm = np.zeros((frames, 2))
+    mixed_sub = np.zeros((frames, 2))
+    
     for v in poly_voices.values():
-        mixed_out += v.next_block(frames)
+        fm_out, sub_out = v.next_block(frames)
+        mixed_fm += fm_out
+        mixed_sub += sub_out
     
     for i in range(frames):
-        # 使用動態的間隔長度來讀取延遲訊號
+        # 讀取 Echo
         read_ptr = (delay_ptr - current_delay_samples) % MAX_DELAY_SAMPLES
         delayed_signal = delay_buffer[read_ptr]
         
-        outdata[i] = mixed_out[i] * 0.6 + delayed_signal * 0.35
+        # 最終混合：FM主音(0.6) + Echo延遲音(0.35) + 40Hz水波驅動音(1.0)
+        # 注意：40Hz 獲得較高的增益以推動實體，且完全不被 Echo 污染
+        outdata[i] = mixed_fm[i] * 0.6 + delayed_signal * 0.35 + mixed_sub[i] * 1.0
         
-        # Feedback 加入隨機微調
+        # 只有 FM 進入 Feedback 系統
         dynamic_feedback = 0.42 + random.uniform(-0.03, 0.03)
-        delay_buffer[delay_ptr] = (mixed_out[i] + delayed_signal * dynamic_feedback)
+        delay_buffer[delay_ptr] = (mixed_fm[i] + delayed_signal * dynamic_feedback)
         delay_ptr = (delay_ptr + 1) % MAX_DELAY_SAMPLES
 
 def handle_imu_data(imu_id, data):
@@ -96,12 +118,12 @@ def handle_imu_data(imu_id, data):
     vals = struct.unpack('<hhhhhhhhh', data[2:20])
     ax, ay, az = [v / 32768.0 * 16 for v in vals[0:3]]
     current_g = (ax**2 + ay**2 + az**2)**0.5
-    roll = vals[6] / 32768.0 * 180 
+    roll = vals[6] / 32768.0 * 180
     pitch = vals[7] / 32768.0 * 180
 
     if imu_id in poly_voices:
         v = poly_voices[imu_id]
-        v.freq = 600 + (pitch + 90) * 12 
+        v.freq = 600 + (pitch + 90) * 12
         v.cutoff = 2000 + abs(roll) * 45
         
         now = time.time()
@@ -110,9 +132,9 @@ def handle_imu_data(imu_id, data):
         last_accel[imu_id] = current_g
         
         if (current_g > 1.8 or delta_g > 0.8) and (now - last_trigger.get(imu_id, 0) > 0.15):
-            v.trigger(current_g) 
+            v.trigger(current_g)
             last_trigger[imu_id] = now
-            print(f"💧 IMU {imu_id} Jittery Trigger! G:{current_g:.2f}")
+            print(f"💧 IMU {imu_id} Wave Trigger! G:{current_g:.2f}")
 
 async def connect_imu(device, imu_id):
     WRITE_CHAR = "0000ffe9-0000-1000-8000-00805f9a34fb"
@@ -129,7 +151,7 @@ async def connect_imu(device, imu_id):
 
 async def manager():
     with sd.OutputStream(channels=2, callback=audio_callback, samplerate=SAMPLERATE):
-        print("=== Sonic Squid: Jittery Rain Edition 啟動 ===")
+        print("=== Sonic Squid: Hydro-Acoustic Edition 啟動 ===")
         connected_addresses = set()
         while True:
             if len(poly_voices) < 4:
