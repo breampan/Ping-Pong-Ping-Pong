@@ -9,7 +9,6 @@ import tkinter as tk
 from tkinter import ttk
 from bleak import BleakClient, BleakScanner
 
-# --- 升級至 48kHz ---
 SAMPLERATE = 48000
 CHANNELS = 2
 
@@ -26,44 +25,37 @@ gui_params = {
     4: {'vol': 0.8, 'tail': 0.5},
 }
 
-SUB_GAIN_BASE = 0.2  
-
-# --- 陽光喜氣大九和弦 (C Major 9: C, E, G, B, D) ---
-MAJOR_9_SCALE = [
-    261.63, # C4
-    329.63, # E4
-    392.00, # G4
-    493.88, # B4
-    587.33, # D5
-    659.25, # E5
-    783.99, # G5
-    987.77, # B5
-    1174.66 # D6
-]
+# 極低的基礎增益，讓 40Hz 變成隱形的物理推手
+SUB_GAIN_BASE = 0.12  
 
 class FMVoice:
     def __init__(self, voice_id):
         self.id = voice_id
         
+        # 回歸科技感的 FM 比例設定
         if voice_id == 1:
             self.base_ratio = 11.72
             self.mod_index = 0.8
+            self.base_freq = 600.0
         elif voice_id == 2:
             self.base_ratio = 3.41
             self.mod_index = 1.2
+            self.base_freq = 400.0
         elif voice_id == 3:
             self.base_ratio = 7.13
             self.mod_index = 0.6
+            self.base_freq = 550.0
         else: 
             self.base_ratio = 2.0
             self.mod_index = 0.4
+            self.base_freq = 350.0
 
-        # 使用目標頻率與當前頻率來做平滑過渡 (防爆音核心)
-        self.freq = MAJOR_9_SCALE[0]
-        self.target_freq = MAJOR_9_SCALE[0]
+        self.freq = self.base_freq
+        self.target_freq = self.base_freq
         
-        self.sub_freq = 65.0  
-        self.target_sub_freq = 65.0
+        # 初始低頻設定在 40Hz
+        self.sub_freq = 40.0  
+        self.target_sub_freq = 40.0
         
         self.ratio = self.base_ratio
         
@@ -84,7 +76,6 @@ class FMVoice:
         self.delay_buffer = np.zeros((self.max_delay_samples, 2))
         self.delay_ptr = 0
         
-        # 消除 Delay Buffer 爆音：給予每顆固定的延遲時間，不再隨機跳動
         delay_times = {1: 0.3, 2: 0.35, 3: 0.4, 4: 0.25}
         self.current_delay_samples = int(SAMPLERATE * delay_times.get(voice_id, 0.3))
 
@@ -94,8 +85,9 @@ class FMVoice:
         self.decay_rate = 0.001 ** (1.0 / (decay_time_sec * SAMPLERATE))
         
         self.target_amp = min(0.8, power / 4.0 + 0.15)
-        # 稍微拉長一點點 Attack，避免低頻開頭的 Click
-        attack_sec = random.uniform(0.04, 0.08)
+        
+        # 為了搭配 40Hz 且避免爆音，Attack 設為 20ms~40ms (約一個 40Hz 的週期)
+        attack_sec = random.uniform(0.02, 0.04)
         self.attack_step = self.target_amp / (SAMPLERATE * attack_sec)
         self.state = 'ATTACK'  
         
@@ -116,45 +108,42 @@ class FMVoice:
                     self.state = 'IDLE'
             env[i] = self.current_amp
 
-        # --- 防爆音核心：平滑頻率滑音 (Portamento) ---
-        glide_speed = 0.01 # 數值越小滑得越慢，0.01 能消除 click 且保留琶音的顆粒感
+        # 恢復科技感的平滑滑音 (Portamento)
+        glide_speed = 0.015 
         
         out_stereo = np.zeros((frames, 2))
         
-        # Sample-accurate 的運算
         for i in range(frames):
-            # 頻率平滑逼近目標
             self.freq += (self.target_freq - self.freq) * glide_speed
             self.sub_freq += (self.target_sub_freq - self.sub_freq) * glide_speed
             
-            # FM 運算
+            # 高頻 FM 運算
             mod_freq = self.freq * self.ratio
             m_val = np.sin(self.phase_m) * self.mod_index
             raw_fm = np.sin(self.phase_c + m_val) * env[i]
             
-            # Sub 運算
-            raw_sub = np.sin(self.phase_sub) * env[i] * SUB_GAIN_BASE
+            # --- 核心修改：Sub-Pizzicato ---
+            # 將 env[i] 平方，創造出極短促、緊實的弱撥弦推力，不影響高頻
+            pizzicato_env = env[i] ** 2
+            raw_sub = np.sin(self.phase_sub) * pizzicato_env * SUB_GAIN_BASE
             
-            # Lowpass Filter
             alpha = self.cutoff / (self.cutoff + SAMPLERATE / (2 * np.pi))
             self.last_out = self.last_out + alpha * (raw_fm - self.last_out)
             
-            # 更新相位
             self.phase_c = (self.phase_c + 2 * np.pi * self.freq / SAMPLERATE) % (2 * np.pi)
             self.phase_m = (self.phase_m + 2 * np.pi * mod_freq / SAMPLERATE) % (2 * np.pi)
             self.phase_sub = (self.phase_sub + 2 * np.pi * self.sub_freq / SAMPLERATE) % (2 * np.pi)
             
-            # Panning
             fm_L = self.last_out * (1.0 - self.pan)
             fm_R = self.last_out * self.pan
             
-            # Ping-Pong Echo
             read_ptr = (self.delay_ptr - self.current_delay_samples) % self.max_delay_samples
             delayed_signal = self.delay_buffer[read_ptr]
             
             mix_L = fm_L * 0.7 + delayed_signal[0] * 0.4
             mix_R = fm_R * 0.7 + delayed_signal[1] * 0.4
             
+            # 結合：高頻 + 隱形極低頻水波驅動
             out_stereo[i, 0] = mix_L + raw_sub
             out_stereo[i, 1] = mix_R + raw_sub
             
@@ -175,8 +164,6 @@ def audio_callback(outdata, frames, time, status):
     for v in poly_voices.values():
         mixed_all += v.next_block(frames)
     
-    # --- 防爆音核心：Soft Clipper (柔和限幅器) ---
-    # 確保總音量不管疊加多少層，波形都不會超過 -1.0 到 1.0 導致 DAC 破音
     outdata[:] = np.tanh(mixed_all)
 
 def handle_imu_data(imu_id, data):
@@ -189,16 +176,14 @@ def handle_imu_data(imu_id, data):
 
     v = poly_voices[imu_id]
     
-    # 映射到大九和弦
-    normalized_pitch = (pitch + 90) / 180.0
-    note_idx = int(normalized_pitch * len(MAJOR_9_SCALE))
-    note_idx = max(0, min(len(MAJOR_9_SCALE) - 1, note_idx))
+    # --- 回歸科技滑音 ---
+    # 高頻：無段連續變化，帶有空靈的科技感
+    v.target_freq = v.base_freq + (pitch + 90) * 8.0 
     
-    # 這裡只改變 target_freq，讓 audio thread 去平滑追蹤
-    v.target_freq = MAJOR_9_SCALE[note_idx]
+    # 低頻：將角度映射到 35Hz ~ 45Hz 的窄頻帶 (中央為 40Hz)
+    normalized_pitch = max(0.0, min(1.0, (pitch + 90) / 180.0))
+    v.target_sub_freq = 35.0 + (normalized_pitch * 10.0)
     
-    # 低頻也平滑追蹤
-    v.target_sub_freq = 65.0 + (pitch + 90) * 0.15 
     v.cutoff = 2000 + abs(roll) * 45
     
     now = time.time()
@@ -209,6 +194,7 @@ def handle_imu_data(imu_id, data):
     if (current_g > 1.8 or delta_g > 0.8) and (now - last_trigger.get(imu_id, 0) > 0.15):
         v.trigger(current_g) 
         last_trigger[imu_id] = now
+        print(f"🛸 IMU {imu_id} Sci-Fi Pluck! High:{v.target_freq:.0f}Hz | Sub:{v.target_sub_freq:.1f}Hz")
 
 async def connect_imu(device, imu_id):
     WRITE_CHAR = "0000ffe9-0000-1000-8000-00805f9a34fb"
@@ -221,7 +207,7 @@ async def connect_imu(device, imu_id):
             poly_voices[imu_id].current_amp = 0.0
             poly_voices[imu_id].state = 'IDLE'
             
-            print(f"✅ IMU {imu_id} 48kHz 無爆音引擎就緒")
+            print(f"✅ IMU {imu_id} 科技滑音引擎就緒")
             await client.start_notify(NOTIFY_CHAR, lambda s, d: handle_imu_data(imu_id, d))
             await client.write_gatt_char(WRITE_CHAR, bytes([0xFF, 0xAA, 0x69, 0x88, 0xB5]))
             while client.is_connected: 
@@ -271,7 +257,7 @@ def create_gui():
     root.geometry("500x420")
     root.configure(padx=20, pady=20)
     
-    title = tk.Label(root, text="Sonic Squid - 展演控制台 (48kHz)", font=("Helvetica", 16, "bold"))
+    title = tk.Label(root, text="Sonic Squid - 展演控制台", font=("Helvetica", 16, "bold"))
     title.grid(row=0, column=0, columnspan=4, pady=(0, 20))
 
     for i in range(1, 5):
