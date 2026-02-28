@@ -21,8 +21,8 @@ delay_buffer = np.zeros((MAX_DELAY_SAMPLES, CHANNELS))
 delay_ptr = 0
 current_delay_samples = int(SAMPLERATE * 0.3)
 
-# 獨立低頻增益：因為 Attack 變短了，需要更大的瞬間能量，預設調高到 0.8
-SUB_GAIN = 0.8  
+# --- 核心修正：大幅降低低頻推力 ---
+SUB_GAIN = 0.2  # 從 0.8 降回 0.2，避免水被炸開
 
 class FMVoice:
     def __init__(self, voice_id):
@@ -49,11 +49,13 @@ class FMVoice:
 
     def trigger(self, power):
         global current_delay_samples
-        self.target_amp = min(1.0, power / 3.0 + 0.2)
         
-        # --- 核心修改 1：Pizzicato 極速 Attack (10ms ~ 30ms) ---
-        # 這會產生類似撥弦或大鼓的瞬間物理推力
-        attack_sec = random.uniform(0.01, 0.03)
+        # 壓縮力度：即使甩很大力，音量最高只到 0.8，留給喇叭緩衝空間
+        self.target_amp = min(0.8, power / 4.0 + 0.15)
+        
+        # --- 核心修正：軟槌打擊感 (30ms ~ 70ms) ---
+        # 夠快能產生撥弦感，但夠慢不至於產生物理爆炸
+        attack_sec = random.uniform(0.03, 0.07)
         self.attack_step = self.target_amp / (SAMPLERATE * attack_sec)
         
         self.decay_rate = random.uniform(0.99975, 0.99988)
@@ -64,7 +66,6 @@ class FMVoice:
         self.ratio = 11.72 + random.uniform(-0.1, 0.1)
 
     def next_block(self, frames):
-        # 生成帶有銳利 Attack 的生猛包絡線
         env = np.zeros(frames)
         for i in range(frames):
             if self.state == 'ATTACK':
@@ -81,15 +82,14 @@ class FMVoice:
 
         t = (np.arange(frames) / SAMPLERATE)
         
-        # FM 高頻
+        # 高頻
         mod_freq = self.freq * self.ratio
         m_vals = np.sin(self.phase_m + 2 * np.pi * mod_freq * t) * self.mod_index
         raw_fm = np.sin(self.phase_c + 2 * np.pi * self.freq * t + m_vals) * env
         
-        # Sub 低頻 (直接吃銳利的 env，產生撥弦感)
+        # 低頻：平行聯動 + 較安全的增益
         raw_sub = np.sin(self.phase_sub + 2 * np.pi * self.sub_freq * t) * env * SUB_GAIN
         
-        # 濾波
         alpha = self.cutoff / (self.cutoff + SAMPLERATE / (2 * np.pi))
         filtered_fm = np.zeros(frames)
         current_last = self.last_out
@@ -98,12 +98,10 @@ class FMVoice:
             filtered_fm[i] = current_last
         self.last_out = current_last
         
-        # 相位推進
         self.phase_c = (self.phase_c + 2 * np.pi * self.freq * frames / SAMPLERATE) % (2 * np.pi)
         self.phase_m = (self.phase_m + 2 * np.pi * mod_freq * frames / SAMPLERATE) % (2 * np.pi)
         self.phase_sub = (self.phase_sub + 2 * np.pi * self.sub_freq * frames / SAMPLERATE) % (2 * np.pi)
         
-        # 空間分配：高頻有 Panning，低頻置中(雙聲道同等輸出推動喇叭)
         fm_stereo = np.zeros((frames, 2))
         fm_stereo[:, 0] = filtered_fm * (1.0 - self.pan)
         fm_stereo[:, 1] = filtered_fm * self.pan
@@ -128,7 +126,7 @@ def audio_callback(outdata, frames, time, status):
         read_ptr = (delay_ptr - current_delay_samples) % MAX_DELAY_SAMPLES
         delayed_signal = delay_buffer[read_ptr]
         
-        # 最終混合：低頻維持直達聲，確保打擊感
+        # 最終混合：低頻維持直達聲，確保推力平滑
         outdata[i] = mixed_fm[i] * 0.6 + delayed_signal * 0.35 + mixed_sub[i]
         
         dynamic_feedback = 0.42 + random.uniform(-0.03, 0.03)
@@ -147,9 +145,7 @@ def handle_imu_data(imu_id, data):
         v = poly_voices[imu_id]
         
         v.freq = 600 + (pitch + 90) * 12 
-        
-        # --- 核心修改 2：窄頻域的平行聯動 ---
-        # 讓低頻範圍約束在 65Hz ~ 95Hz 之間，完美落在 Cymatics 駐波帶
+        # 維持在 65Hz ~ 95Hz 的黃金水波駐波帶
         v.sub_freq = 65.0 + (pitch + 90) * 0.15 
         
         v.cutoff = 2000 + abs(roll) * 45
@@ -162,7 +158,7 @@ def handle_imu_data(imu_id, data):
         if (current_g > 1.8 or delta_g > 0.8) and (now - last_trigger.get(imu_id, 0) > 0.15):
             v.trigger(current_g) 
             last_trigger[imu_id] = now
-            print(f"🎸 IMU {imu_id} Pizzicato! High:{v.freq:.0f}Hz / Sub:{v.sub_freq:.1f}Hz")
+            print(f"🎸 IMU {imu_id} Soft Pluck! High:{v.freq:.0f}Hz / Sub:{v.sub_freq:.1f}Hz")
 
 async def connect_imu(device, imu_id):
     WRITE_CHAR = "0000ffe9-0000-1000-8000-00805f9a34fb"
@@ -188,7 +184,7 @@ async def connect_imu(device, imu_id):
 
 async def manager():
     with sd.OutputStream(channels=2, callback=audio_callback, samplerate=SAMPLERATE):
-        print("=== Pizzicato Sub-Bass 水波引擎 啟動 ===")
+        print("=== Soft-Pluck 水波引擎 啟動 ===")
         while True:
             if len(poly_voices) + len(reserved_ids) < 4:
                 devices = await BleakScanner.discover(timeout=1.0)
